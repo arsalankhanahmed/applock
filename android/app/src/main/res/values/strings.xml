@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">AppLock &amp; Vault</string>
+    <string name="accessibility_service_description">Used by AppLock to detect when locked applications like WhatsApp or Photos are launched and display your security lock screen.</string>
+    <string name="unlock_title">AppLock Security</string>
+    <string name="enter_pin">Enter 4-Digit PIN</string>
+    <string name="pattern_prompt">Draw your unlock pattern</string>
+    <string name="intruder_warning">Intruder Selfie Active</string>
+</resources>

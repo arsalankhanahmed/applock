@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16" />
+      <stop offset="100%" stop-color="#0f172a" />
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4" />
+      <stop offset="50%" stop-color="#0891b2" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#06b6d4" flood-opacity="0.3" />
+    </filter>
+  </defs>
+
+  <!-- Background with rounded corners -->
+  <rect width="512" height="512" rx="128" fill="url(#bgGrad)" />
+
+  <!-- Shield Shape -->
+  <g filter="url(#glow)">
+    <path d="M256 70 C340 100 410 110 410 170 C410 310 330 400 256 442 C182 400 102 310 102 170 C102 110 172 100 256 70 Z"
+          fill="url(#shieldGrad)" />
+  </g>
+
+  <!-- Inner Dark Shield -->
+  <path d="M256 94 C324 120 384 130 384 180 C384 296 316 376 256 414 C196 376 128 296 128 180 C128 130 188 120 256 94 Z"
+        fill="#090d16" opacity="0.9" />
+
+  <!-- Padlock Icon Center -->
+  <rect x="200" y="235" width="112" height="95" rx="20" fill="#06b6d4" />
+  <path d="M216 235 V195 C216 172.9 233.9 155 256 155 C278.1 155 296 172.9 296 195 V235"
+        fill="none" stroke="#06b6d4" stroke-width="22" stroke-linecap="round" />
+  <circle cx="256" cy="275" r="10" fill="#090d16" />
+  <path d="M256 285 V305" stroke="#090d16" stroke-width="6" stroke-linecap="round" />
+</svg>

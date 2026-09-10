@@ -1,0 +1,6 @@
+{
+  "name": "AppLock & Private Vault",
+  "description": "Secure AppLock with pattern, passcode, and fingerprint options, app usage limits, intruder selfie capture, private photo vault, and Gemini AI security assistant.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
