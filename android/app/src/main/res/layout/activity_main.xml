@@ -23,6 +23,15 @@
         android:textColor="@color/accent"
         android:textSize="13sp" />
 
+    <Button
+        android:id="@+id/btnBookLearning"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:backgroundTint="@color/accent"
+        android:text="📚 Learn a Book on Every Unlock"
+        android:textColor="@color/background_dark" />
+
     <!-- Permission Setup Card -->
     <LinearLayout
         android:layout_width="match_parent"

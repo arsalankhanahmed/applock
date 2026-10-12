@@ -43,3 +43,35 @@ When you launch the app on your phone for the first time:
 2. Tap **"2. Enable Accessibility Service"** (Allows detecting when WhatsApp is opened).
 3. Tap **"3. Grant Usage Access"**.
 4. Select the apps you want to lock from your phone's real apps list.
+
+---
+
+## 📚 Book Learning on Unlock (PDF micro-learning)
+
+Give the app any PDF book, in any language. Each time you unlock your phone, a small card shows
+**one slide** from the book for a few seconds (5 by default): a one-line key idea plus a very
+short explanation. The slides follow the book in order, starting with the introduction, so you
+work through the whole book a few seconds at a time.
+
+### How it works
+1. **Import:** the PDF is copied into app storage and uploaded to Gemini's Files API, so Gemini can
+   read any language, including scanned books.
+2. **Structure:** Gemini maps out the book in reading order as chapters → small sections
+   (about 1–5 pages each).
+3. **Slides:** each section becomes 3–8 micro-slides (headline ≤ 12 words, detail ≤ 25 words).
+   They are generated a few sections at a time, and more are fetched in the background
+   when fewer than 10 unread slides are left.
+4. **Pop-up:** the accessibility service listens for the unlock event (`ACTION_USER_PRESENT`)
+   and shows the next slide as an accessibility overlay. It can also show one every N minutes
+   while you use the phone.
+   - Tap the card → next slide · ✕ → close · it fades away on its own after the timer.
+
+### Setup on the phone
+1. Open the app → **📚 Learn a Book on Every Unlock**.
+2. Paste a Gemini API key (free at https://aistudio.google.com/apikey) and tap **Save settings**.
+   - *Slides language*: leave empty to use the book's own language, or type e.g. `Urdu`, `Hindi`, `English`.
+3. Tap **Enable Accessibility Service** and turn on *AppLock & Vault*.
+4. Tap **➕ Import PDF book**, pick your PDF, and wait for "ready".
+5. Lock and unlock your phone. 🎉
+
+Code: `app/src/main/java/com/applock/vault/learn/`.

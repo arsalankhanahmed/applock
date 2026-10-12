@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/background_dark"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="📚 Book Learning on Unlock"
+            android:textColor="@color/text_white"
+            android:textSize="22sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Give any PDF book (any language). Every time you unlock your phone, one tiny slide from it appears for a few seconds, step by step from the start."
+            android:textColor="@color/text_muted"
+            android:textSize="13sp" />
+
+        <!-- Settings card -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@color/card_dark"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView style="@style/LearnLabel" android:text="Gemini API key (free at aistudio.google.com)" />
+            <EditText
+                android:id="@+id/inputApiKey"
+                style="@style/LearnInput"
+                android:hint="AIza…"
+                android:inputType="textPassword" />
+
+            <TextView style="@style/LearnLabel" android:text="Gemini model" />
+            <EditText
+                android:id="@+id/inputModel"
+                style="@style/LearnInput"
+                android:inputType="text" />
+
+            <TextView style="@style/LearnLabel" android:text="Slides language (empty = same as the book)" />
+            <EditText
+                android:id="@+id/inputLanguage"
+                style="@style/LearnInput"
+                android:hint="e.g. Urdu, Hindi, English"
+                android:inputType="text" />
+
+            <TextView style="@style/LearnLabel" android:text="Pop-up duration (seconds, 2-15)" />
+            <EditText
+                android:id="@+id/inputSeconds"
+                style="@style/LearnInput"
+                android:inputType="number" />
+
+            <TextView style="@style/LearnLabel" android:text="While using phone, also show every N minutes (0 = off)" />
+            <EditText
+                android:id="@+id/inputInterval"
+                style="@style/LearnInput"
+                android:inputType="number" />
+
+            <Switch
+                android:id="@+id/switchEnabled"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Book learning enabled"
+                android:textColor="@color/text_white" />
+
+            <Switch
+                android:id="@+id/switchUnlock"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Show a slide on every unlock"
+                android:textColor="@color/text_white" />
+
+            <Button
+                android:id="@+id/btnSaveLearn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:backgroundTint="@color/primary"
+                android:text="Save settings"
+                android:textColor="@color/background_dark" />
+
+            <Button
+                android:id="@+id/btnAccessibility"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:backgroundTint="@color/card_dark"
+                android:text="Enable Accessibility Service (required for pop-ups)"
+                android:textColor="@color/primary" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnImportPdf"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:backgroundTint="@color/accent"
+            android:text="➕ Import PDF book"
+            android:textColor="@color/background_dark" />
+
+        <ProgressBar
+            android:id="@+id/learnProgress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:indeterminate="true"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/learnStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/text_muted"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btnPreview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:backgroundTint="@color/card_dark"
+            android:text="👀 Preview next slide"
+            android:textColor="@color/primary" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="My books (tap for options)"
+            android:textColor="@color/text_white"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/booksEmpty"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="No books yet."
+            android:textColor="@color/text_muted" />
+
+        <ListView
+            android:id="@+id/booksList"
+            android:layout_width="match_parent"
+            android:layout_height="320dp"
+            android:layout_marginTop="4dp"
+            android:divider="@color/card_dark"
+            android:dividerHeight="1dp"
+            android:nestedScrollingEnabled="true" />
+    </LinearLayout>
+</ScrollView>

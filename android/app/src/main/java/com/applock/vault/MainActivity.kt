@@ -16,6 +16,7 @@ import android.widget.Button
 import android.widget.ListView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.applock.vault.learn.LearnActivity
 
 class MainActivity : AppCompatActivity() {
 
@@ -42,6 +43,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupPermissionButtons() {
+        findViewById<Button>(R.id.btnBookLearning).setOnClickListener {
+            startActivity(Intent(this, LearnActivity::class.java))
+        }
+
         findViewById<Button>(R.id.btnOverlayPermission).setOnClickListener {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
                 val intent = Intent(
