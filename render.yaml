@@ -1,0 +1,38 @@
+# Render Blueprint: AuditX API on the free plan (eager background jobs, Neon PostgreSQL).
+# Render -> New -> Blueprint -> select this repository.
+services:
+  - type: web
+    name: auditx-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./auditx-backend/Dockerfile
+    dockerContext: ./auditx-backend
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: ROLE
+        value: api
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: CELERY_TASK_ALWAYS_EAGER
+        value: "true"
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PARSER_CHUNK_ROWS
+        value: "50000"
+      - key: MAX_UPLOAD_MB
+        value: "200"
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "5"
