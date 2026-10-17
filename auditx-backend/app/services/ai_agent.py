@@ -93,6 +93,25 @@ TABLE resolution_requests (
   , status VARCHAR  -- 'PENDING','APPROVED','REJECTED','WITHDRAWN'
   , created_at TIMESTAMPTZ, decided_at TIMESTAMPTZ
 )  -- maker-checker approval requests for resolving discrepancy_logs (status 'PENDING_APPROVAL' while queued)
+TABLE recovery_claims (
+  claim_id UUID, org_id UUID, claim_number VARCHAR  -- e.g. CLM-0007
+  , counterparty_type VARCHAR  -- 'COURIER', 'GATEWAY' or 'BANK'
+  , counterparty_name VARCHAR  -- e.g. TCS, LEOPARDS, PAYMENT GATEWAY
+  , currency VARCHAR(3)
+  , status VARCHAR  -- 'DRAFT','SUBMITTED','PARTIALLY_RECOVERED','RECOVERED','REJECTED','WRITTEN_OFF','CANCELLED'
+  , claimed_amount NUMERIC, recovered_amount NUMERIC, written_off_amount NUMERIC, due_date DATE,
+  created_at TIMESTAMPTZ, submitted_at TIMESTAMPTZ, closed_at TIMESTAMPTZ
+)  -- money claimed back from couriers, gateways and banks; outstanding = claimed - recovered - written_off
+TABLE recovery_claim_items (
+  item_id UUID, claim_id UUID, org_id UUID, source_order_number VARCHAR, issue_type VARCHAR, channel VARCHAR,
+  amount NUMERIC, root_cause_category VARCHAR, data_cleared_amount NUMERIC, active BOOLEAN
+)  -- the findings inside each claim; join to recovery_claims on claim_id
+TABLE recovery_events (
+  event_id UUID, claim_id UUID, org_id UUID,
+  kind VARCHAR  -- 'CREATED','SUBMITTED','EMAILED','PAYMENT','DATA_MATCH','REJECTED','WRITTEN_OFF','CANCELLED'
+  , amount NUMERIC  -- for PAYMENT / DATA_MATCH: money recovered
+  , reference VARCHAR, occurred_on DATE, created_at TIMESTAMPTZ
+)  -- claim timeline; recovered cash = SUM(amount) WHERE kind IN ('PAYMENT','DATA_MATCH')
 TABLE organizations (org_id UUID, company_name VARCHAR, brand_currency VARCHAR(3), created_at TIMESTAMPTZ)
 """.strip()
 
@@ -165,6 +184,19 @@ TENANT_VIEWS = {
     "resolution_requests": (
         "SELECT request_id, org_id, log_id, source_order_number, issue_type, channel, amount, root_cause_category, "
         "proposed_by_type, status, created_at, decided_at FROM public.resolution_requests WHERE org_id = '{org}'"
+    ),
+    "recovery_claims": (
+        "SELECT claim_id, org_id, claim_number, counterparty_type, counterparty_name, currency, status, claimed_amount, "
+        "recovered_amount, written_off_amount, due_date, created_at, submitted_at, closed_at "
+        "FROM public.recovery_claims WHERE org_id = '{org}'"
+    ),
+    "recovery_claim_items": (
+        "SELECT item_id, claim_id, org_id, source_order_number, issue_type, channel, amount, root_cause_category, "
+        "data_cleared_amount, active FROM public.recovery_claim_items WHERE org_id = '{org}'"
+    ),
+    "recovery_events": (
+        "SELECT event_id, claim_id, org_id, kind, amount, reference, occurred_on, created_at "
+        "FROM public.recovery_events WHERE org_id = '{org}'"
     ),
     "approval_policies": "SELECT NULL::uuid AS org_id WHERE FALSE",
     "invitations": "SELECT NULL::uuid AS invite_id, NULL::uuid AS org_id WHERE FALSE",
@@ -284,6 +316,17 @@ def _llm_narrative(question: str, sql: str, frame: pd.DataFrame) -> str:
 
 
 _INTENTS: List[Tuple[re.Pattern, str, str]] = [
+    (
+        re.compile(r"(recover|claim|claw ?back|written off|write[- ]?off)", re.I),
+        "Money claimed back from each counterparty: claimed, recovered, written off and still outstanding.",
+        """SELECT c.counterparty_name, c.counterparty_type, COUNT(*) AS claims,
+                  ROUND(SUM(c.claimed_amount), 2) AS claimed, ROUND(SUM(c.recovered_amount), 2) AS recovered,
+                  ROUND(SUM(c.written_off_amount), 2) AS written_off,
+                  ROUND(SUM(c.claimed_amount - c.recovered_amount - c.written_off_amount)
+                        FILTER (WHERE c.status IN ('DRAFT', 'SUBMITTED', 'PARTIALLY_RECOVERED')), 2) AS outstanding
+             FROM recovery_claims c WHERE c.org_id = :org_id AND c.status <> 'CANCELLED'
+            GROUP BY c.counterparty_name, c.counterparty_type ORDER BY outstanding DESC NULLS LAST, recovered DESC LIMIT 50""",
+    ),
     (
         re.compile(r"(approv|pending|checker|maker|sign[- ]?off|queue)", re.I),
         "Resolution requests waiting for a checker, by who proposed them and root cause.",

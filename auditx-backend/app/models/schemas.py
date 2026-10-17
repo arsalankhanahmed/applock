@@ -1,5 +1,5 @@
 """Pydantic v2 request / response validation layer for the AuditX API."""
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -198,6 +198,7 @@ class DiscrepancyOut(BaseModel):
     auto_resolved: bool
     detected_at: datetime
     resolved_at: Optional[datetime]
+    claim_number: Optional[str] = None
 
 
 class DiscrepancyPage(BaseModel):
@@ -422,3 +423,147 @@ class AgentQueryResponse(BaseModel):
     truncated: bool
     engine: str
     elapsed_ms: int
+
+
+# ---------------------------------------------------------------- recovery & claims
+class ClaimStatus(str, Enum):
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    PARTIALLY_RECOVERED = "PARTIALLY_RECOVERED"
+    RECOVERED = "RECOVERED"
+    REJECTED = "REJECTED"
+    WRITTEN_OFF = "WRITTEN_OFF"
+    CANCELLED = "CANCELLED"
+
+
+class CounterpartyType(str, Enum):
+    COURIER = "COURIER"
+    GATEWAY = "GATEWAY"
+    BANK = "BANK"
+
+
+class ClaimableFinding(BaseModel):
+    log_id: UUID
+    source_order_number: str
+    issue_type: IssueType
+    channel: Channel
+    amount: Decimal
+    root_cause_category: Optional[str]
+    counterparty_type: CounterpartyType
+    counterparty_name: str
+    evidence: Dict[str, Any]
+
+
+class ClaimableGroup(BaseModel):
+    counterparty_type: CounterpartyType
+    counterparty_name: str
+    total: Decimal
+    count: int
+    items: List[ClaimableFinding]
+
+
+class ClaimCreate(BaseModel):
+    log_ids: List[UUID] = Field(min_length=1, max_length=500)
+    counterparty_contact: Optional[EmailStr] = None
+    notes: Optional[str] = Field(default=None, max_length=1000)
+    due_days: int = Field(default=14, ge=1, le=120)
+
+
+class ClaimSubmit(BaseModel):
+    send_email: bool = False
+    counterparty_contact: Optional[EmailStr] = None
+
+
+class ClaimPayment(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    reference: Optional[str] = Field(default=None, max_length=128)
+    received_on: Optional[date] = None
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class ClaimNote(BaseModel):
+    note: str = Field(min_length=3, max_length=1000)
+
+
+class ClaimItemOut(BaseModel):
+    item_id: UUID
+    source_order_number: str
+    issue_type: IssueType
+    channel: Channel
+    amount: Decimal
+    root_cause_category: Optional[str]
+    evidence: Dict[str, Any]
+    data_cleared_amount: Decimal
+    active: bool
+    finding_status: Optional[str]
+
+
+class ClaimEventOut(BaseModel):
+    event_id: UUID
+    kind: str
+    amount: Optional[Decimal]
+    reference: Optional[str]
+    note: Optional[str]
+    actor_email: Optional[str]
+    occurred_on: date
+    created_at: datetime
+
+
+class ClaimSummaryRow(BaseModel):
+    claim_id: UUID
+    claim_number: str
+    counterparty_type: CounterpartyType
+    counterparty_name: str
+    counterparty_contact: Optional[str]
+    currency: str
+    status: ClaimStatus
+    claimed_amount: Decimal
+    recovered_amount: Decimal
+    written_off_amount: Decimal
+    outstanding_amount: Decimal
+    due_date: Optional[date]
+    notes: Optional[str]
+    created_by_email: Optional[str]
+    created_at: datetime
+    submitted_at: Optional[datetime]
+    closed_at: Optional[datetime]
+    item_count: Optional[int] = None
+
+
+class ClaimOut(ClaimSummaryRow):
+    items: List[ClaimItemOut]
+    events: List[ClaimEventOut]
+    letter_subject: str
+    letter_text: str
+    email_sent: Optional[bool] = None
+    email_error: Optional[str] = None
+    resolutions: List[Dict[str, Any]] = []
+
+
+class ClaimPage(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: List[ClaimSummaryRow]
+
+
+class CounterpartyRecovery(BaseModel):
+    counterparty_type: CounterpartyType
+    counterparty_name: str
+    open_claims: int
+    claimed: Decimal
+    recovered: Decimal
+    outstanding: Decimal
+
+
+class RecoverySummary(BaseModel):
+    currency: str
+    claimable_count: int
+    claimable_value: Decimal
+    open_claims: int
+    open_value: Decimal
+    recovered_total: Decimal
+    recovered_this_month: Decimal
+    written_off_total: Decimal
+    recovery_rate_pct: Optional[Decimal]
+    by_counterparty: List[CounterpartyRecovery]

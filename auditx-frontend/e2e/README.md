@@ -21,6 +21,10 @@ Black-box tests that drive a real Chromium browser through the AuditX dashboard,
 | `team.spec.ts` | UC-09 | Owner invites an auditor by link; invitee joins; link works only once |
 | | UC-10 | Member added with a temporary password must choose their own |
 | | UC-11 | Analysts don't get team-management controls |
+| `recovery.spec.ts` | UC-14 | Analyst drafts a claim for TCS from the claimable list, checks the letter and marks it sent; the finding shows *Claimed · CLM-0001* |
+| | UC-15 | Part payment then the balance; full recovery sends C2 to a checker |
+| | UC-15 | Auditor sees the recovery (100% recovered), approves the close-out, and has no "Create claim" button |
+| | UC-16 | TCS's next report and the bank statement show C2 paid; reconciliation credits the claim automatically |
 
 Use cases and business test cases: `docs/testing/USE_CASES.md`, `docs/testing/BUSINESS_TEST_CASES.md`.
 
@@ -35,9 +39,11 @@ Each spec registers a **brand-new company** through the API, adds its users, upl
 | `03_courier_remittances.csv` | TCS parcels: C1 remitted (CPR-1), C2 delivered but never remitted, T9 still in transit |
 | `04_bank_statement.csv` | Bank credits for payout `po_A` (209.80) and courier remittance CPR-1 (57.50) |
 | `users.csv` | The 5 test users, their roles and passwords |
-| `expected_results.csv` | What AuditX must find and why: 4 findings, 4 clean matches |
+| `05_courier_update_c2_remitted.csv` | TCS's later report: C2 now remitted under CPR-2 (used by UC-16) |
+| `06_bank_statement_update.csv` | The bank credit for CPR-2, 67.50 (used by UC-16) |
+| `expected_results.csv` | What AuditX must find and why: 4 findings, 4 clean matches, and C2's recovery after files 05/06 |
 
-**Expected findings:** O2 *Missing Payment* 55.00 · O3 *Untracked Revenue* 42.00 · O4 *Amount Mismatch* 5.00 (AI fix waits for a checker) · C2 *COD Not Remitted* 70.00.
+**Expected findings:** O2 *Missing Payment* 55.00 · O3 *Untracked Revenue* 42.00 · O4 *Amount Mismatch* 5.00 (AI fix waits for a checker) · C2 *COD Not Remitted* 70.00 order, 67.50 owed by TCS after its 2.50 charge. C2 is the one **claimable** finding.
 
 ## How to run
 

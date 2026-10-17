@@ -206,6 +206,28 @@ suspected manipulation, is never auto-resolved. It goes to a human with the work
 
 ---
 
+## Slide 11A — Recovery & Claims: from "we found it" to "we got it back"
+
+**On slide:** *Every rupee a courier, gateway or bank owes becomes a claim, and AuditX tracks it until the cash is back.*
+
+| Step | What AuditX does |
+|------|------------------|
+| 1. Claimable | Lists money owed per counterparty, e.g. TCS Rs 2.3 lakh, Leopards Rs 80k, Payment gateway Rs 45k |
+| 2. Claim | One click builds `CLM-0007` with a claim letter (orders, CN numbers, dates, total, due date), ready to email or print |
+| 3. Track | Records each payment against the claim; overpayment is impossible |
+| 4. Auto-detect | When the courier's next report shows the order remitted, the claim is credited by itself |
+| 5. Close | Recovered or written-off findings close through maker-checker, so the audit trail stays complete |
+
+**Headline tile (example):** *"Rs 4,80,000 recovered this month · 86% of amounts claimed."*
+
+**Script:**
+"Most tools stop at the exception report. Your team then spends a week on emails and spreadsheets chasing
+couriers. AuditX writes the claim letter for you and follows the money. When TCS finally pays, the next
+reconciliation notices and closes the claim. The number on this tile is the money AuditX put back in your
+account this month, and it is usually many times the subscription fee."
+
+---
+
 ## Slide 12 — Chat-with-your-Ledger
 
 **On slide:** *"Which orders over $500 have no payment?" → answer in seconds, with the SQL shown.*

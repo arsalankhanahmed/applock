@@ -126,6 +126,12 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | POST / DELETE | `/invites/{invite_id}/resend`, `/invites/{invite_id}` | New link + email / revoke |
 | GET / POST | `/invites/token/{token}`, `/invites/token/{token}/accept` | Public: show an invite / accept it with `full_name` + `password` (signs the person in) |
 | GET | `/dashboard/metrics` | KPIs, per-channel and per-issue exposure, root causes, per-courier COD ledger |
+| GET | `/recovery/summary`, `/recovery/claimable` | Recovered this month / to date, open claims, and open findings owed by a courier, gateway or bank (grouped by counterparty) |
+| GET / POST | `/claims` | List claims (`status=OPEN` or a claim status) / draft one from `log_ids` of one counterparty (OWNER / ADMIN / ANALYST) |
+| GET | `/claims/{claim_id}`, `/claims/{claim_id}/letter` | Claim with items, timeline and letter / the letter as subject, text and print-ready HTML |
+| POST | `/claims/{claim_id}/submit` | Mark as sent; `{"send_email": true, "counterparty_contact": "..."}` emails the letter |
+| POST | `/claims/{claim_id}/payments` | `{"amount", "reference", "received_on"}`; refused above the outstanding balance |
+| POST | `/claims/{claim_id}/reject` / `write-off` / `cancel` | Counterparty refused (needs `note`) / stop chasing the balance (needs `note`) / drop a draft |
 | POST | `/agent/query` | `{"question": "..."}` → SQL, rows, narrative |
 
 ## 4. Bank and COD reconciliation
@@ -258,6 +264,42 @@ or a free transactional-email plan (Brevo, Mailjet and similar offer small free 
 limits) is enough for team invites. For local testing, run a mail catcher such as Mailpit
 (`docker run -p 8025:8025 -p 1025:1025 axllent/mailpit`) and set `SMTP_HOST=host.docker.internal`,
 `SMTP_PORT=1025`, `SMTP_STARTTLS=false`; invites appear at `http://localhost:8025`.
+
+### 4.7 Recovery & claims
+
+Finding the leak is half the job; the **Recovery & Claims** panel gets the money back.
+
+1. **Claimable** lists every open finding a counterparty owes, grouped by who owes it:
+   * couriers: COD not remitted, short remittance, overcharged delivery, lost parcel;
+   * the payment gateway: a payout never deposited or deposited short;
+   * a courier remittance that never reached the bank, or bank charges.
+
+   Customer-side and internal findings (missing payments, returns still booked, etc.) are never claimable.
+2. **Create claim** turns the selected findings into a draft (`CLM-0001`, `CLM-0002`, …) with a claim letter
+   built from the evidence: order, tracking number, delivery date, amount. The letter states the total, a due
+   date (14 days by default) and asks for the claim number as the payment reference.
+3. **Email letter** sends it to the counterparty over the same SMTP settings as invitations, with your address as
+   Reply-To. **Mark as sent** is for letters you send yourself. **View letter**, **Copy letter** and
+   **Print / PDF** are always available.
+4. **Record payment** books each amount received, and a payment larger than the balance is refused.
+   **Mark rejected** releases the findings so they can be claimed again or written off. **Write off balance**
+   stops chasing the remainder.
+5. **AuditX notices recovery by itself.** Every reconciliation re-checks open claims. When the courier's next
+   report shows the order remitted, or the bank shows the payout, the claim is credited with a
+   *"Payment seen in courier / bank data"* event. If only part was paid (an unpaid COD order becomes a smaller
+   short remittance), only that part is credited. Recorded payments and data matches are both capped at the
+   outstanding balance, so the same money is never counted twice.
+6. **Closing goes through maker-checker.** When a claim is fully recovered or written off, each finding still
+   open is submitted for resolution under the approval policy, as `RECOVERED_FROM_COUNTERPARTY` or `WRITE_OFF`,
+   with the claim number and payment reference in the note. With the default policy a checker approves it.
+
+While a finding is in an open claim it shows **Claimed · CLM-000n** in the tracking matrix and cannot be put in
+a second claim. The headline tiles show money recovered this month, recovered to date (and as a % of amounts
+claimed), the balance still out with counterparties, and what can be claimed now. The forensic agent answers
+questions such as *"How much have we recovered from couriers?"* from the claim tables, which are tenant-isolated
+like every other table.
+
+Roles: OWNER, ADMIN and ANALYST run claims. AUDITOR and VIEWER can see them but not create or change them.
 
 ## 5. Security model of the Forensic Agent
 
@@ -465,7 +507,7 @@ so only enable it during pilot weeks.
 The full test pack is in [`docs/testing/`](testing/): [strategy](testing/TEST_STRATEGY.md), [use cases](testing/USE_CASES.md), [business test cases](testing/BUSINESS_TEST_CASES.md) and the latest [test report](testing/TEST_REPORT.md).
 
 ```bash
-# Backend: unit, integration, black-box API and regression (277 tests, ~1 min)
+# Backend: unit, integration, black-box API and regression (~1 min)
 createdb -U auditx auditx_test                 # once; the suite refuses any database not named auditx_test
 cd auditx-backend && pip install -r requirements-dev.txt
 pytest                                         # or: pytest -m unit | integration | api | regression

@@ -29,6 +29,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
+from app.services import recovery
 from app.services.bank_reconciliation import reconcile_bank
 from app.services.cod_reconciliation import reconcile_cod
 
@@ -101,6 +102,7 @@ class ReconciliationReport:
     by_issue_type: Dict[str, int] = field(default_factory=dict)
     bank: Dict[str, Any] = field(default_factory=dict)
     cod: Dict[str, Any] = field(default_factory=dict)
+    recovery: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, object]:
         return dict(self.__dict__)
@@ -217,6 +219,13 @@ def reconcile_org(org_id: UUID, tolerance_cents: int | None = None) -> Reconcili
     findings["variance_cents"] = findings["variance_cents"].astype("int64")
     findings, skipped = _exclude_resolved(findings, resolved)
     _write_logs(org_id, findings)
+    # Claims whose findings shrank or vanished in the fresh data have been (partly) paid. A failure here must not
+    # fail the reconciliation that already succeeded: the claim simply stays open until the next run.
+    try:
+        recovery_summary = recovery.sync_with_data(org_id).as_dict()
+    except Exception as exc:  # noqa: BLE001 - logged and surfaced in the report
+        logger.exception("Recovery sync failed for org=%s", org_id)
+        recovery_summary = {"error": f"{type(exc).__name__}: {exc}"}
 
     counts = findings["issue_type"].value_counts()
     for channel, summary in (("BANK", bank_summary), ("COD", cod_summary)):
@@ -239,6 +248,7 @@ def reconcile_org(org_id: UUID, tolerance_cents: int | None = None) -> Reconcili
         by_issue_type={k: int(v) for k, v in counts.items()},
         bank=bank_summary,
         cod=cod_summary,
+        recovery=recovery_summary,
     )
     logger.info("Reconciliation complete: %s", report.as_dict())
     return report

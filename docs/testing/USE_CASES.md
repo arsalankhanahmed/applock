@@ -1,6 +1,6 @@
 # AuditX — Use Cases
 
-Actors: **Owner** (company account holder), **Admin**, **Analyst** (maker), **Auditor** (checker), **Viewer**, **Invitee**, **AI Auto-Healer** (system actor), **Forensic Agent** (system actor), **Courier / Gateway / Bank** (external data sources, via files).
+Actors: **Owner** (company account holder), **Admin**, **Analyst** (maker), **Auditor** (checker), **Viewer**, **Invitee**, **AI Auto-Healer** (system actor), **Forensic Agent** (system actor), **Courier / Gateway / Bank** (external data sources, via files, and the counterparties money is claimed back from).
 
 Each use case lists its main flow, alternate and exception flows, and the business test cases that verify it ([BUSINESS_TEST_CASES.md](BUSINESS_TEST_CASES.md)).
 
@@ -136,3 +136,41 @@ Verified by: BTC-22, BTC-32
 Every read and write is scoped to the caller's company: lists, jobs, approvals, team, invites, agent answers.
 
 Verified by: BTC-33, BTC-34
+
+### UC-14 Claim money back from a counterparty
+**Actor:** Owner / Admin / Analyst · **Pre:** reconciliation found money a courier, gateway or bank owes
+
+1. User opens **Recovery & Claims → Claimable**, which lists the open findings grouped by counterparty (e.g. TCS, Payment gateway).
+2. User un-ticks anything not to claim and presses **Create claim**.
+3. System creates a draft `CLM-000n` with a claim letter (items, evidence, total, due date) and locks the findings to this claim. The matrix shows *Claimed · CLM-000n*.
+4. User **emails the letter** to the counterparty, or **marks it as sent** and uses **Copy letter** / **Print / PDF**.
+
+* **E1** Findings from two counterparties in one claim → 422. **E2** A finding already in an open claim, resolved, or owed by a customer → 409.
+* **E3** No SMTP or no address → the claim is still marked sent, with a message to copy or print the letter.
+* **E4** Auditor / Viewer → can view, but cannot create or change claims (403, no buttons).
+
+Verified by: BTC-35, BTC-36, BTC-37, BTC-41, BTC-45
+
+### UC-15 Record recovery and close the claim
+**Actor:** Owner / Admin / Analyst, then a checker
+
+1. User records each payment received (amount, bank reference, date). The claim becomes *Partly recovered*.
+2. When nothing is outstanding the claim is *Recovered*, and each finding still open is submitted for resolution as `RECOVERED_FROM_COUNTERPARTY` through maker-checker.
+3. A checker approves; the findings close. Headline tiles show recovered this month, to date, and the recovery rate.
+
+* **A1** Counterparty refuses → **Mark rejected** with a reason; findings can be claimed again.
+* **A2** Not worth chasing → **Write off balance** with a reason; findings go to a checker as `WRITE_OFF`.
+* **E1** Payment above the outstanding balance, zero or negative → 422. **E2** Payment on a draft or a closed claim → 409.
+
+Verified by: BTC-38, BTC-39, BTC-40, BTC-42
+
+### UC-16 Recovery detected automatically in fresh data
+**Actor:** System (reconciliation) · **Trigger:** a new courier report or bank statement is uploaded and reconciled
+
+1. Reconciliation rebuilds findings, then re-checks every claim that is sent or partly recovered.
+2. If a claimed finding has disappeared (the courier remitted, the bank shows the payout), the claim is credited with a *Payment seen in courier / bank data* event.
+3. If it only shrank (part paid), only the difference is credited.
+
+* **E1** A finding closed by a person is not treated as payment. **E2** Data matches and recorded payments never add up to more than the claim.
+
+Verified by: BTC-43, BTC-44
