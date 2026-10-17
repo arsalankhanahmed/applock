@@ -1,0 +1,6 @@
+source_order_number,total_amount,payment_method
+O1,100.00,card
+O2,55.00,card
+O4,80.00,card
+C1,60.00,COD
+C2,70.00,COD

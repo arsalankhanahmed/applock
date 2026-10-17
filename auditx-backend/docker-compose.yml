@@ -1,0 +1,101 @@
+name: auditx
+
+x-backend-env: &backend-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-auditx}:${POSTGRES_PASSWORD:-auditx}@db:5432/${POSTGRES_DB:-auditx}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-64-random-bytes}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USERNAME: ${SMTP_USERNAME:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-AuditX <no-reply@auditx.local>}
+  SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+  UPLOAD_DIR: /data/uploads
+  PARSER_CHUNK_ROWS: ${PARSER_CHUNK_ROWS:-100000}
+
+services:
+  api:
+    build: .
+    image: auditx-backend:latest
+    environment:
+      <<: *backend-env
+      ROLE: api
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: auditx-backend:latest
+    build: .
+    environment:
+      <<: *backend-env
+      ROLE: worker
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-4}
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.tasks inspect ping -d celery@$$HOSTNAME --timeout 5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-auditx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-auditx}
+      POSTGRES_DB: ${POSTGRES_DB:-auditx}
+    command: >
+      postgres -c shared_buffers=256MB -c work_mem=32MB -c maintenance_work_mem=256MB
+               -c max_connections=200 -c checkpoint_completion_target=0.9
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
