@@ -121,6 +121,10 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | GET / PUT | `/approval-policy` | Read / change the tenant's approval policy (PUT: OWNER / ADMIN) |
 | GET / POST | `/users` | List team members / add one (OWNER / ADMIN), e.g. an AUDITOR to act as checker |
 | PATCH / DELETE | `/users/{user_id}` | Change a member's role or name, reset their password / remove them (OWNER / ADMIN) |
+| POST | `/me/password` | Change your own password (`current_password`, `new_password`); returns a fresh token |
+| POST / GET | `/invites` | Invite by email (OWNER / ADMIN) / list pending invites (`include_closed` for history) |
+| POST / DELETE | `/invites/{invite_id}/resend`, `/invites/{invite_id}` | New link + email / revoke |
+| GET / POST | `/invites/token/{token}`, `/invites/token/{token}/accept` | Public: show an invite / accept it with `full_name` + `password` (signs the person in) |
 | GET | `/dashboard/metrics` | KPIs, per-channel and per-issue exposure, root causes, per-courier COD ledger |
 | POST | `/agent/query` | `{"question": "..."}` → SQL, rows, narrative |
 
@@ -218,10 +222,42 @@ change roles, reset passwords and remove people:
 | VIEWER | Read-only dashboard and chat |
 
 Rules: only an owner can create, change or remove an owner; nobody can change their own role or remove
-themselves; a company always keeps at least one owner. New members get a temporary password (the
-**Generate** button makes a strong one), shown once to share privately. Roles are read from the database
+themselves; a company always keeps at least one owner.
+
+**Adding someone** (Team → Add member), two ways:
+
+* **Send email invite** (recommended). The person gets an email with a one-time link (valid
+  `INVITE_EXPIRY_DAYS`, default 7) to `/invite`, where they choose their name and password and are signed in.
+  Pending invites are listed under the team with **Resend** (new link, old one stops working) and **Revoke**.
+  Only a SHA-256 hash of the link is stored. If email isn't configured or sending fails, the invite is still
+  created and the link is shown once to copy and share yourself.
+* **Set a temporary password.** The **Generate** button makes a strong one, shown once to share privately.
+  The person must choose their own password at first sign-in; until then the API only allows `/me` and
+  `/me/password`.
+
+**Passwords.** Anyone can change their password from **Change password** in the header. Changing it, or an
+admin resetting it, signs out every other session of that account (tokens issued before the change stop
+working). An admin reset also makes the person choose a new password at next sign-in. Roles are read from the database
 on every request, so a role change or removal takes effect immediately, even for someone already signed in.
 A removed member's approval history stays, with their email on each request.
+
+### 4.6 Sending invitation email
+
+Set these on the API (and worker) service; any SMTP provider works:
+
+| Variable | Example |
+|----------|---------|
+| `APP_BASE_URL` | `https://auditx.vercel.app` (links in emails point here) |
+| `SMTP_HOST`, `SMTP_PORT` | `smtp.gmail.com`, `587` · `smtp-relay.brevo.com`, `587` · `smtp.office365.com`, `587` |
+| `SMTP_USERNAME`, `SMTP_PASSWORD` | the account, or an app password / SMTP key |
+| `SMTP_FROM` | `AuditX <no-reply@yourcompany.com>` (must be a sender your provider allows) |
+| `SMTP_STARTTLS` / `SMTP_SSL` | `true` / `false` for port 587; `false` / `true` for port 465 |
+
+For a zero-cost MVP, a Gmail account with an [app password](https://support.google.com/accounts/answer/185833)
+or a free transactional-email plan (Brevo, Mailjet and similar offer small free daily quotas; check current
+limits) is enough for team invites. For local testing, run a mail catcher such as Mailpit
+(`docker run -p 8025:8025 -p 1025:1025 axllent/mailpit`) and set `SMTP_HOST=host.docker.internal`,
+`SMTP_PORT=1025`, `SMTP_STARTTLS=false`; invites appear at `http://localhost:8025`.
 
 ## 5. Security model of the Forensic Agent
 

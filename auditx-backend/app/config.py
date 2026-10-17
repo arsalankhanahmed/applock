@@ -29,6 +29,20 @@ class Settings(BaseSettings):
     JWT_EXPIRE_MINUTES: int = 720
 
     CORS_ORIGINS: str = "http://localhost:3000"
+    # Public URL of the dashboard, used to build links in invitation emails.
+    APP_BASE_URL: str = "http://localhost:3000"
+
+    # Outgoing email for team invitations. Leave SMTP_HOST empty to skip sending: the invite link is then
+    # shown in the dashboard for the admin to share.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "AuditX <no-reply@auditx.local>"
+    SMTP_STARTTLS: bool = True
+    SMTP_SSL: bool = False
+    SMTP_TIMEOUT_SECONDS: float = 10.0
+    INVITE_EXPIRY_DAYS: int = 7
 
     UPLOAD_DIR: str = "/data/uploads"
     MAX_UPLOAD_MB: int = 2048

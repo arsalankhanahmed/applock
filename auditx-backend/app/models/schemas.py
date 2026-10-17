@@ -112,6 +112,7 @@ class TokenResponse(BaseModel):
     user_id: UUID
     role: UserRole
     company_name: str
+    must_change_password: bool = False
 
 
 class CurrentUser(BaseModel):
@@ -119,6 +120,7 @@ class CurrentUser(BaseModel):
     org_id: UUID
     role: UserRole
     email: EmailStr
+    must_change_password: bool = False
 
 
 # ---------------------------------------------------------------- data dictionary / mappings
@@ -218,6 +220,59 @@ class UserOut(BaseModel):
     email: EmailStr
     role: UserRole
     created_at: datetime
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=10, max_length=128)
+
+
+class InviteStatus(str, Enum):
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
+
+
+class InviteCreate(BaseModel):
+    email: EmailStr
+    role: UserRole
+    full_name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+
+
+class InviteOut(BaseModel):
+    invite_id: UUID
+    email: EmailStr
+    full_name: Optional[str]
+    role: UserRole
+    status: InviteStatus
+    invited_by_email: Optional[str]
+    send_count: int
+    last_sent_at: Optional[datetime]
+    last_send_error: Optional[str]
+    created_at: datetime
+    expires_at: datetime
+    accepted_at: Optional[datetime]
+
+
+class InviteSent(InviteOut):
+    invite_url: str
+    email_sent: bool
+    email_error: Optional[str]
+
+
+class InvitePublic(BaseModel):
+    email: EmailStr
+    full_name: Optional[str]
+    role: UserRole
+    company_name: str
+    invited_by_email: Optional[str]
+    expires_at: datetime
+
+
+class InviteAccept(BaseModel):
+    full_name: str = Field(min_length=2, max_length=255)
+    password: str = Field(min_length=10, max_length=128)
 
 
 class UserUpdate(BaseModel):

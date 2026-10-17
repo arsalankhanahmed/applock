@@ -13,6 +13,19 @@ import {
   type ErrorInfo,
 } from "react";
 
+import { Logo, Spinner } from "../components/brand";
+import {
+  API_BASE,
+  ApiError,
+  MIN_PASSWORD_LENGTH,
+  api,
+  loadSession,
+  saveSession,
+  sessionFromToken,
+  type Session,
+  type TokenResponse,
+} from "../lib/client";
+
 /* ============================================================================
  * Types — mirror app/models/schemas.py
  * ========================================================================== */
@@ -38,22 +51,6 @@ type AutoHealMode = "AUTO" | "THRESHOLD" | "ALWAYS_APPROVE";
 type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 type JobType = "INGEST_ORDERS" | "INGEST_GATEWAY" | "INGEST_BANK" | "INGEST_COURIER" | "RECONCILIATION";
 type Money = string | number;
-
-interface Session {
-  token: string;
-  companyName: string;
-  role: string;
-}
-
-interface TokenResponse {
-  access_token: string;
-  token_type: string;
-  expires_in: number;
-  org_id: string;
-  user_id: string;
-  role: string;
-  company_name: string;
-}
 
 interface IssueBreakdown {
   issue_type: IssueType;
@@ -213,7 +210,29 @@ interface Member {
 }
 
 interface MeResponse {
-  user: { user_id: string; org_id: string; role: Role; email: string };
+  user: { user_id: string; org_id: string; role: Role; email: string; must_change_password: boolean };
+}
+
+type InviteState = "PENDING" | "ACCEPTED" | "REVOKED" | "EXPIRED";
+
+interface Invite {
+  invite_id: string;
+  email: string;
+  full_name: string | null;
+  role: Role;
+  status: InviteState;
+  invited_by_email: string | null;
+  send_count: number;
+  last_sent_at: string | null;
+  last_send_error: string | null;
+  created_at: string;
+  expires_at: string;
+}
+
+interface InviteSent extends Invite {
+  invite_url: string;
+  email_sent: boolean;
+  email_error: string | null;
 }
 
 interface BulkResult {
@@ -281,62 +300,6 @@ interface ChatMessage {
   role: "user" | "assistant" | "error";
   text: string;
   answer?: AgentAnswer;
-}
-
-/* ============================================================================
- * API client
- * ========================================================================== */
-const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
-const SESSION_KEY = "auditx.session";
-
-class ApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
-  }
-}
-
-async function api<T>(path: string, token: string | null, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-  if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
-  let response: Response;
-  try {
-    response = await fetch(`${API_BASE}${path}`, { ...init, headers });
-  } catch {
-    throw new ApiError(0, `Cannot reach the AuditX API at ${API_BASE}`);
-  }
-  if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body: unknown = await response.json();
-      if (body && typeof body === "object" && "detail" in body) {
-        const d = (body as { detail: unknown }).detail;
-        detail = typeof d === "string" ? d : JSON.stringify(d);
-      }
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new ApiError(response.status, detail);
-  }
-  return (await response.json()) as T;
-}
-
-function loadSession(): Session | null {
-  try {
-    const raw = window.localStorage.getItem(SESSION_KEY);
-    return raw ? (JSON.parse(raw) as Session) : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveSession(session: Session | null): void {
-  try {
-    if (session) window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-    else window.localStorage.removeItem(SESSION_KEY);
-  } catch {
-    /* storage unavailable (private mode) — session lives in memory only */
-  }
 }
 
 async function waitForJob(token: string, jobId: string, onTick: (job: Job) => void): Promise<Job> {
@@ -496,10 +459,6 @@ function Skeleton({ className = "" }: { className?: string }) {
   return <div className={`animate-pulse rounded-md bg-ink-700/60 ${className}`} />;
 }
 
-function Spinner({ className = "h-4 w-4" }: { className?: string }) {
-  return <span className={`inline-block animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} />;
-}
-
 function TypingDots() {
   return (
     <span className="inline-flex items-center gap-1">
@@ -546,7 +505,7 @@ function LoginGate({ onAuthenticated }: { onAuthenticated: (s: Session) => void 
         method: "POST",
         body: JSON.stringify({ email, password }),
       });
-      onAuthenticated({ token: res.access_token, companyName: res.company_name, role: res.role });
+      onAuthenticated(sessionFromToken(res));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -585,20 +544,6 @@ function LoginGate({ onAuthenticated }: { onAuthenticated: (s: Session) => void 
         </button>
         <p className="mt-4 text-center text-[11px] text-slate-500">Demo credentials are created by the seeder.</p>
       </form>
-    </div>
-  );
-}
-
-function Logo() {
-  return (
-    <div className="flex items-center gap-2.5">
-      <div className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-emerald-400 to-sky-500 text-sm font-black text-ink-950">X</div>
-      <div>
-        <p className="text-base font-bold tracking-tight text-slate-100">
-          Audit<span className="text-emerald-400">X</span>
-        </p>
-        <p className="-mt-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-500">Forensic Reconciliation</p>
-      </div>
     </div>
   );
 }
@@ -1555,11 +1500,35 @@ function generatePassword(): string {
   return `${body}#${(bytes[0] % 90) + 10}`;
 }
 
+function timeUntil(iso: string): string {
+  const seconds = (new Date(iso).getTime() - Date.now()) / 1000;
+  if (seconds <= 0) return "expired";
+  if (seconds < 3600) return `expires in ${Math.ceil(seconds / 60)}m`;
+  if (seconds < 86400) return `expires in ${Math.ceil(seconds / 3600)}h`;
+  return `expires in ${Math.ceil(seconds / 86400)}d`;
+}
+
+async function copyText(value: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type Shared =
+  | { kind: "password"; name: string; email: string; password: string }
+  | { kind: "invite"; email: string; url: string; sent: boolean; error: string | null; expires: string };
+
 function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; myUserId: string | null }) {
   const [members, setMembers] = useState<Member[] | null>(null);
+  const [invites, setInvites] = useState<Invite[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [shared, setShared] = useState<{ name: string; email: string; password: string } | null>(null);
+  const [shared, setShared] = useState<Shared | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [mode, setMode] = useState<"invite" | "password">("invite");
   const [form, setForm] = useState<{ full_name: string; email: string; role: Role; password: string }>({
     full_name: "",
     email: "",
@@ -1577,17 +1546,36 @@ function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; m
         setError(null);
       })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : "Failed to load the team"));
-  }, [token]);
+    if (canManage) {
+      api<Invite[]>("/api/v1/invites", token)
+        .then(setInvites)
+        .catch(() => setInvites([]));
+    }
+  }, [token, canManage]);
 
   useEffect(load, [load]);
+
+  function showInvite(sent: InviteSent) {
+    setCopied(false);
+    setShared({ kind: "invite", email: sent.email, url: sent.invite_url, sent: sent.email_sent, error: sent.email_error, expires: sent.expires_at });
+  }
 
   async function addMember(e: FormEvent) {
     e.preventDefault();
     setBusy("add");
     setError(null);
     try {
-      const created = await api<Member>("/api/v1/users", token, { method: "POST", body: JSON.stringify(form) });
-      setShared({ name: created.full_name, email: created.email, password: form.password });
+      if (mode === "invite") {
+        const sent = await api<InviteSent>("/api/v1/invites", token, {
+          method: "POST",
+          body: JSON.stringify({ email: form.email, role: form.role, full_name: form.full_name.trim() || null }),
+        });
+        showInvite(sent);
+      } else {
+        const created = await api<Member>("/api/v1/users", token, { method: "POST", body: JSON.stringify(form) });
+        setCopied(false);
+        setShared({ kind: "password", name: created.full_name, email: created.email, password: form.password });
+      }
       setForm({ full_name: "", email: "", role: form.role, password: "" });
       setShowForm(false);
       load();
@@ -1598,64 +1586,61 @@ function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; m
     }
   }
 
-  async function changeRole(m: Member, role: Role) {
-    setBusy(m.user_id);
+  async function run(id: string, action: () => Promise<void>, failure: string) {
+    setBusy(id);
     setError(null);
     try {
-      await api<Member>(`/api/v1/users/${m.user_id}`, token, { method: "PATCH", body: JSON.stringify({ role }) });
+      await action();
       load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not change the role");
+      setError(err instanceof Error ? err.message : failure);
     } finally {
       setBusy(null);
     }
   }
 
-  async function resetPassword(m: Member) {
-    if (!window.confirm(`Set a new password for ${m.full_name}? Their current password stops working.`)) return;
+  const changeRole = (m: Member, role: Role) =>
+    run(m.user_id, () => api<Member>(`/api/v1/users/${m.user_id}`, token, { method: "PATCH", body: JSON.stringify({ role }) }).then(() => undefined), "Could not change the role");
+
+  const resetPassword = (m: Member) => {
+    if (!window.confirm(`Set a new temporary password for ${m.full_name}? They are signed out and must choose their own password at next sign-in.`)) return;
     const password = generatePassword();
-    setBusy(m.user_id);
-    setError(null);
-    try {
-      await api<Member>(`/api/v1/users/${m.user_id}`, token, { method: "PATCH", body: JSON.stringify({ password }) });
-      setShared({ name: m.full_name, email: m.email, password });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not reset the password");
-    } finally {
-      setBusy(null);
-    }
-  }
+    void run(
+      m.user_id,
+      async () => {
+        await api<Member>(`/api/v1/users/${m.user_id}`, token, { method: "PATCH", body: JSON.stringify({ password }) });
+        setCopied(false);
+        setShared({ kind: "password", name: m.full_name, email: m.email, password });
+      },
+      "Could not reset the password",
+    );
+  };
 
-  async function remove(m: Member) {
+  const remove = (m: Member) => {
     if (!window.confirm(`Remove ${m.full_name} (${m.email})? They lose access immediately; their approval history stays.`)) return;
-    setBusy(m.user_id);
-    setError(null);
-    try {
-      await fetch(`${API_BASE}/api/v1/users/${m.user_id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }).then(async (r) => {
-        if (!r.ok) {
-          const body: unknown = await r.json().catch(() => null);
-          throw new Error(body && typeof body === "object" && "detail" in body ? String((body as { detail: unknown }).detail) : r.statusText);
-        }
-      });
-      load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not remove the member");
-    } finally {
-      setBusy(null);
-    }
-  }
+    void run(m.user_id, () => api<void>(`/api/v1/users/${m.user_id}`, token, { method: "DELETE" }), "Could not remove the member");
+  };
+
+  const resend = (i: Invite) =>
+    run(i.invite_id, async () => showInvite(await api<InviteSent>(`/api/v1/invites/${i.invite_id}/resend`, token, { method: "POST" })), "Could not resend the invite");
+
+  const revoke = (i: Invite) => {
+    if (!window.confirm(`Revoke the invitation for ${i.email}? The link stops working.`)) return;
+    void run(i.invite_id, () => api<void>(`/api/v1/invites/${i.invite_id}`, token, { method: "DELETE" }), "Could not revoke the invite");
+  };
 
   async function copyShared() {
     if (!shared) return;
-    try {
-      await navigator.clipboard.writeText(`AuditX sign-in\nEmail: ${shared.email}\nPassword: ${shared.password}`);
-    } catch {
-      /* clipboard blocked: the details stay on screen to copy by hand */
-    }
+    const value =
+      shared.kind === "password"
+        ? `AuditX sign-in\nEmail: ${shared.email}\nTemporary password: ${shared.password}\nYou will be asked to choose your own password.`
+        : shared.url;
+    setCopied(await copyText(value));
   }
 
   const input = "rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-emerald-500";
   const smallButton = "rounded-md border border-ink-600 px-2 py-0.5 text-[11px] text-slate-300 hover:border-slate-400 disabled:opacity-50";
+  const tab = (active: boolean) => `rounded-md px-2.5 py-1 ${active ? "bg-ink-700 text-slate-100" : "text-slate-400 hover:text-slate-200"}`;
 
   return (
     <Card
@@ -1670,54 +1655,89 @@ function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; m
     >
       {error && <p className="mb-3 rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
       {shared && (
-        <div className="mb-4 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs text-emerald-100">
-          <p className="font-semibold">Share these sign-in details with {shared.name} privately. This password is shown only once.</p>
-          <p className="mt-1.5 font-mono">
-            {shared.email} · {shared.password}
-          </p>
+        <div
+          className={`mb-4 rounded-xl border p-3 text-xs ${
+            shared.kind === "invite" && !shared.sent ? "border-amber-500/40 bg-amber-500/10 text-amber-100" : "border-emerald-500/40 bg-emerald-500/10 text-emerald-100"
+          }`}
+        >
+          {shared.kind === "password" ? (
+            <>
+              <p className="font-semibold">Share these sign-in details with {shared.name} privately. This password is shown only once.</p>
+              <p className="mt-1.5 font-mono">
+                {shared.email} · {shared.password}
+              </p>
+              <p className="mt-1 opacity-80">They will be asked to choose their own password when they sign in.</p>
+            </>
+          ) : (
+            <>
+              <p className="font-semibold">
+                {shared.sent ? `Invitation emailed to ${shared.email}.` : `The invitation for ${shared.email} was created but not emailed.`}
+              </p>
+              {!shared.sent && shared.error && <p className="mt-1 opacity-90">{shared.error}</p>}
+              <p className="mt-1.5 break-all font-mono opacity-90">{shared.url}</p>
+              <p className="mt-1 opacity-80">The link works once and {timeUntil(shared.expires)}. Anyone with it can join, so share it only with {shared.email}.</p>
+            </>
+          )}
           <div className="mt-2 flex gap-2">
-            <button onClick={() => void copyShared()} className="rounded-md border border-emerald-400/50 px-2 py-0.5 hover:bg-emerald-500/10">
-              Copy
+            <button onClick={() => void copyShared()} className="rounded-md border border-current/40 px-2 py-0.5 hover:bg-white/5">
+              {copied ? "Copied" : shared.kind === "invite" ? "Copy link" : "Copy"}
             </button>
-            <button onClick={() => setShared(null)} className="rounded-md border border-emerald-400/50 px-2 py-0.5 hover:bg-emerald-500/10">
+            <button onClick={() => setShared(null)} className="rounded-md border border-current/40 px-2 py-0.5 hover:bg-white/5">
               Done
             </button>
           </div>
         </div>
       )}
       {showForm && canManage && (
-        <form onSubmit={addMember} className="mb-4 grid gap-3 rounded-xl border border-ink-700 bg-ink-850/60 p-4 text-xs md:grid-cols-2">
-          <label className="flex flex-col gap-1">
-            <span className="text-slate-400">Full name</span>
-            <input required minLength={2} value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} className={input} />
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-slate-400">Work email</span>
-            <input required type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className={input} />
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-slate-400">Role</span>
-            <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })} className={input}>
-              {assignable.map((r) => (
-                <option key={r} value={r}>
-                  {humanize(r)}
-                </option>
-              ))}
-            </select>
-            <span className="text-[11px] text-slate-500">{ROLE_GUIDE[form.role]}</span>
-          </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-slate-400">Temporary password (10+ characters)</span>
-            <div className="flex gap-2">
-              <input required minLength={10} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className={`${input} flex-1 font-mono`} />
-              <button type="button" onClick={() => setForm({ ...form, password: generatePassword() })} className="rounded-lg border border-ink-600 px-2.5 text-slate-300 hover:border-slate-400">
-                Generate
-              </button>
-            </div>
-          </label>
-          <div className="md:col-span-2 flex justify-end">
+        <form onSubmit={addMember} className="mb-4 rounded-xl border border-ink-700 bg-ink-850/60 p-4 text-xs">
+          <div className="mb-3 inline-flex rounded-lg border border-ink-600 p-0.5">
+            <button type="button" onClick={() => setMode("invite")} className={tab(mode === "invite")}>
+              Send email invite
+            </button>
+            <button type="button" onClick={() => setMode("password")} className={tab(mode === "password")}>
+              Set a temporary password
+            </button>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="flex flex-col gap-1">
+              <span className="text-slate-400">Full name{mode === "invite" ? " (optional)" : ""}</span>
+              <input required={mode === "password"} minLength={2} value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} className={input} />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-slate-400">Work email</span>
+              <input required type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className={input} />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-slate-400">Role</span>
+              <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })} className={input}>
+                {assignable.map((r) => (
+                  <option key={r} value={r}>
+                    {humanize(r)}
+                  </option>
+                ))}
+              </select>
+              <span className="text-[11px] text-slate-500">{ROLE_GUIDE[form.role]}</span>
+            </label>
+            {mode === "password" ? (
+              <label className="flex flex-col gap-1">
+                <span className="text-slate-400">Temporary password ({MIN_PASSWORD_LENGTH}+ characters)</span>
+                <div className="flex gap-2">
+                  <input required minLength={MIN_PASSWORD_LENGTH} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className={`${input} flex-1 font-mono`} />
+                  <button type="button" onClick={() => setForm({ ...form, password: generatePassword() })} className="rounded-lg border border-ink-600 px-2.5 text-slate-300 hover:border-slate-400">
+                    Generate
+                  </button>
+                </div>
+                <span className="text-[11px] text-slate-500">They must replace it with their own password at first sign-in.</span>
+              </label>
+            ) : (
+              <p className="self-end text-[11px] leading-relaxed text-slate-500">
+                They get an email with a one-time link (valid {7} days) to choose their own password and join.
+              </p>
+            )}
+          </div>
+          <div className="mt-3 flex justify-end">
             <button type="submit" disabled={busy === "add"} className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1.5 font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-60">
-              {busy === "add" && <Spinner className="h-3 w-3" />} Add to team
+              {busy === "add" && <Spinner className="h-3 w-3" />} {mode === "invite" ? "Send invite" : "Add to team"}
             </button>
           </div>
         </form>
@@ -1771,10 +1791,10 @@ function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; m
                     <td className="px-5 py-2.5 text-right">
                       {editable && (
                         <div className="flex justify-end gap-1.5">
-                          <button onClick={() => void resetPassword(m)} disabled={busy === m.user_id} className={smallButton}>
+                          <button onClick={() => resetPassword(m)} disabled={busy === m.user_id} className={smallButton}>
                             Reset password
                           </button>
-                          <button onClick={() => void remove(m)} disabled={busy === m.user_id} className={`${smallButton} border-rose-500/40 text-rose-300 hover:bg-rose-500/10`}>
+                          <button onClick={() => remove(m)} disabled={busy === m.user_id} className={`${smallButton} border-rose-500/40 text-rose-300 hover:bg-rose-500/10`}>
                             Remove
                           </button>
                         </div>
@@ -1787,8 +1807,133 @@ function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; m
           </table>
         </div>
       )}
+      {canManage && invites.length > 0 && (
+        <div className="mt-5">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Pending invitations</p>
+          <ul className="divide-y divide-ink-700 rounded-xl border border-ink-700">
+            {invites.map((i) => (
+              <li key={i.invite_id} className={`flex flex-wrap items-center gap-3 px-4 py-2.5 ${busy === i.invite_id ? "opacity-60" : ""}`}>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm text-slate-200">
+                    {i.full_name ? `${i.full_name} · ` : ""}
+                    <span className="text-slate-400">{i.email}</span>
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    {humanize(i.role)} · invited by {i.invited_by_email ?? "—"} {timeAgo(i.created_at)} ·{" "}
+                    {i.send_count > 0 ? `emailed ${i.send_count}×` : "not emailed (link shared by hand)"}
+                  </p>
+                </div>
+                <Badge className={i.status === "EXPIRED" ? TONE.rose : TONE.amber}>{i.status === "EXPIRED" ? "Expired" : timeUntil(i.expires_at)}</Badge>
+                {(i.role !== "OWNER" || myRole === "OWNER") && (
+                  <div className="flex gap-1.5">
+                    <button onClick={() => void resend(i)} disabled={busy === i.invite_id} className={smallButton}>
+                      {i.status === "EXPIRED" ? "Send new link" : "Resend"}
+                    </button>
+                    <button onClick={() => revoke(i)} disabled={busy === i.invite_id} className={`${smallButton} border-rose-500/40 text-rose-300 hover:bg-rose-500/10`}>
+                      Revoke
+                    </button>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {!canManage && <p className="mt-3 text-xs text-slate-500">Only owners and admins can add or change team members.</p>}
     </Card>
+  );
+}
+
+/* ============================================================================
+ * Password change (forced after a temporary password, or from the header)
+ * ========================================================================== */
+function PasswordChangeForm({ token, onChanged, onCancel }: { token: string; onChanged: (session: Session) => void; onCancel?: () => void }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (next !== confirm) {
+      setError("The new passwords don't match");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api<TokenResponse>("/api/v1/me/password", token, {
+        method: "POST",
+        body: JSON.stringify({ current_password: current, new_password: next }),
+      });
+      onChanged(sessionFromToken(res));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not change the password");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const field = "mt-1.5 w-full rounded-lg border border-ink-600 bg-ink-850 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-500";
+  return (
+    <form onSubmit={submit} className="space-y-4">
+      <label className="block text-xs font-medium uppercase tracking-wider text-slate-400">
+        Current password
+        <input type="password" required autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} className={field} />
+      </label>
+      <label className="block text-xs font-medium uppercase tracking-wider text-slate-400">
+        New password ({MIN_PASSWORD_LENGTH}+ characters)
+        <input type="password" required minLength={MIN_PASSWORD_LENGTH} autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} className={field} />
+      </label>
+      <label className="block text-xs font-medium uppercase tracking-wider text-slate-400">
+        Repeat new password
+        <input type="password" required minLength={MIN_PASSWORD_LENGTH} autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} className={field} />
+      </label>
+      {error && <p className="rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
+      <div className="flex justify-end gap-2">
+        {onCancel && (
+          <button type="button" onClick={onCancel} className="rounded-lg border border-ink-600 px-4 py-2 text-sm text-slate-300 hover:border-slate-400">
+            Cancel
+          </button>
+        )}
+        <button type="submit" disabled={busy} className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-60">
+          {busy && <Spinner />} Change password
+        </button>
+      </div>
+      <p className="text-[11px] text-slate-500">Other devices signed in to your account are signed out.</p>
+    </form>
+  );
+}
+
+function ForcedPasswordChange({ session, onChanged, onSignOut }: { session: Session; onChanged: (s: Session) => void; onSignOut: () => void }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="w-full max-w-sm rounded-2xl border border-ink-700 bg-ink-900 p-7 shadow-2xl shadow-black/50">
+        <Logo />
+        <h1 className="mt-5 text-lg font-semibold text-slate-100">Choose your own password</h1>
+        <p className="mt-1 text-sm text-slate-400">
+          You signed in to {session.companyName} with a temporary password. Replace it to continue.
+        </p>
+        <div className="mt-5">
+          <PasswordChangeForm token={session.token} onChanged={onChanged} />
+        </div>
+        <button onClick={onSignOut} className="mt-4 text-xs text-slate-500 underline-offset-2 hover:text-slate-300 hover:underline">
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PasswordDialog({ token, onChanged, onClose }: { token: string; onChanged: (s: Session) => void; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" role="dialog" aria-modal="true" aria-label="Change password">
+      <div className="w-full max-w-sm rounded-2xl border border-ink-700 bg-ink-900 p-6 shadow-2xl shadow-black/60">
+        <h2 className="mb-4 text-base font-semibold text-slate-100">Change password</h2>
+        <PasswordChangeForm token={token} onChanged={onChanged} onCancel={onClose} />
+      </div>
+    </div>
   );
 }
 
@@ -2066,7 +2211,7 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    if (!session) return;
+    if (!session || session.mustChangePassword) return;
     let cancelled = false;
     setLoading(true);
     api<DashboardMetrics>("/api/v1/dashboard/metrics", session.token)
@@ -2089,6 +2234,7 @@ export default function DashboardPage() {
 
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
   const [myUserId, setMyUserId] = useState<string | null>(null);
+  const [passwordDialog, setPasswordDialog] = useState(false);
 
   // The server decides roles; pick up a role change (or removal) made since this browser signed in.
   useEffect(() => {
@@ -2096,8 +2242,8 @@ export default function DashboardPage() {
     api<MeResponse>("/api/v1/me", session.token)
       .then((me) => {
         setMyUserId(me.user.user_id);
-        if (me.user.role !== session.role) {
-          const next = { ...session, role: me.user.role };
+        if (me.user.role !== session.role || me.user.must_change_password !== !!session.mustChangePassword) {
+          const next = { ...session, role: me.user.role, mustChangePassword: me.user.must_change_password };
           saveSession(next);
           setSession(next);
         }
@@ -2112,6 +2258,19 @@ export default function DashboardPage() {
   const canEditPolicy = useMemo(() => !!session && ["OWNER", "ADMIN"].includes(session.role), [session]);
 
   if (!hydrated) return null;
+  if (session?.mustChangePassword) {
+    return (
+      <ForcedPasswordChange
+        session={session}
+        onChanged={(s) => {
+          saveSession(s);
+          setSession(s);
+        }}
+        onSignOut={logout}
+      />
+    );
+  }
+
   if (!session) {
     return (
       <LoginGate
@@ -2127,6 +2286,17 @@ export default function DashboardPage() {
 
   return (
     <main className="mx-auto max-w-[1600px] px-4 py-6 md:px-8">
+      {passwordDialog && (
+        <PasswordDialog
+          token={session.token}
+          onClose={() => setPasswordDialog(false)}
+          onChanged={(s) => {
+            saveSession(s);
+            setSession(s);
+            setPasswordDialog(false);
+          }}
+        />
+      )}
       <header className="mb-6 flex flex-col justify-between gap-4 md:flex-row md:items-center">
         <div className="flex items-center gap-5">
           <Logo />
@@ -2138,6 +2308,9 @@ export default function DashboardPage() {
               <a href="#team" className="ml-3 text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline">
                 Team
               </a>
+              <button onClick={() => setPasswordDialog(true)} className="ml-3 text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline">
+                Change password
+              </button>
               <button onClick={logout} className="ml-3 text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline">
                 Sign out
               </button>

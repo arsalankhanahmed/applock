@@ -33,12 +33,13 @@ from app.database import engine, init_db
 from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, ApprovalPage, ApprovalPolicyIn,
                                 ApprovalPolicyOut, ApprovalRequestOut, BulkDecisionRequest, BulkDecisionResult,
                                 Channel, CurrentUser, DashboardMetrics, DecisionRequest, RequestStatus, UserCreate,
-                                UserOut, UserUpdate,
+                                UserOut, UserUpdate, PasswordChangeRequest, InviteCreate, InviteOut, InviteSent,
+                                InvitePublic, InviteAccept, InviteStatus,
                                 DataDictionaryField, DiscrepancyOut, DiscrepancyPage, DiscrepancyStatus,
                                 FieldMappingBulkIn, FieldMappingOut, IngestTarget, IssueType, JobAccepted,
                                 JobOut, JobStatus, JobType, LoginRequest, ManualResolveRequest,
                                 ReconciliationRequest, RegisterRequest, TokenResponse, UserRole)
-from app.services import ai_agent, approvals
+from app.services import ai_agent, approvals, mailer
 from app.workers.tasks import ingest_file, run_reconciliation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -84,29 +85,39 @@ def issue_token(user_id: UUID, org_id: UUID, role: str, email: str) -> str:
 
 
 bearer = HTTPBearer(auto_error=False)
+PASSWORD_CHANGE_PATHS = {f"{settings.API_PREFIX}/me", f"{settings.API_PREFIX}/me/password"}
 
 
-async def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)) -> CurrentUser:
+async def current_user(request: Request, creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)) -> CurrentUser:
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
     try:
         claims = jwt.decode(creds.credentials, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM],
                             issuer="auditx")
-        user_id, org_id = UUID(claims["sub"]), UUID(claims["org"])
+        user_id, org_id, issued_at = UUID(claims["sub"]), UUID(claims["org"]), int(claims["iat"])
     except (jwt.PyJWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Invalid token: {exc}",
                             headers={"WWW-Authenticate": "Bearer"}) from exc
     # The token proves identity; the role always comes from the database, so a removed or demoted
     # member loses access immediately instead of when the token expires.
     row = await run_in_threadpool(
-        _fetch_one, "SELECT role, email FROM users WHERE user_id = :u AND org_id = :o",
+        _fetch_one,
+        "SELECT role, email, must_change_password, password_changed_at FROM users WHERE user_id = :u AND org_id = :o",
         {"u": str(user_id), "o": str(org_id)},
     )
     if not row:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "This account no longer has access",
                             headers={"WWW-Authenticate": "Bearer"})
-    return CurrentUser(user_id=user_id, org_id=org_id, role=row["role"], email=row["email"])
+    changed = row["password_changed_at"]
+    if changed is not None and issued_at < int(changed.timestamp()):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Your password was changed; please sign in again",
+                            headers={"WWW-Authenticate": "Bearer"})
+    # Someone signed in with a temporary password may only look at their profile and choose a new one.
+    if row["must_change_password"] and request.url.path not in PASSWORD_CHANGE_PATHS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Choose a new password before continuing")
+    return CurrentUser(user_id=user_id, org_id=org_id, role=row["role"], email=row["email"],
+                       must_change_password=row["must_change_password"])
 
 
 def require_roles(*roles: UserRole) -> Callable[..., Any]:
@@ -239,7 +250,7 @@ async def register(body: RegisterRequest) -> TokenResponse:
 async def login(body: LoginRequest) -> TokenResponse:
     row = await run_in_threadpool(
         _fetch_one,
-        "SELECT u.user_id, u.org_id, u.password_hash, u.role, u.email, o.company_name "
+        "SELECT u.user_id, u.org_id, u.password_hash, u.role, u.email, u.must_change_password, o.company_name "
         "FROM users u JOIN organizations o ON o.org_id = u.org_id WHERE u.email = lower(:e)",
         {"e": body.email},
     )
@@ -247,7 +258,35 @@ async def login(body: LoginRequest) -> TokenResponse:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
     token = issue_token(row["user_id"], row["org_id"], row["role"], row["email"])
     return TokenResponse(access_token=token, expires_in=settings.JWT_EXPIRE_MINUTES * 60, org_id=row["org_id"],
-                         user_id=row["user_id"], role=row["role"], company_name=row["company_name"])
+                         user_id=row["user_id"], role=row["role"], company_name=row["company_name"],
+                         must_change_password=row["must_change_password"])
+
+
+@app.post(f"{P}/me/password", response_model=TokenResponse, tags=["auth"])
+async def change_my_password(body: PasswordChangeRequest, user: CurrentUser = Depends(current_user)) -> TokenResponse:
+    """Change your own password. Other sessions are signed out; this one gets a fresh token."""
+    def run() -> TokenResponse:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT u.password_hash, o.company_name FROM users u JOIN organizations o USING (org_id) "
+                     "WHERE u.user_id = :u FOR UPDATE OF u"),
+                {"u": str(user.user_id)},
+            ).mappings().one()
+            if not verify_password(body.current_password, row["password_hash"]):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Current password is incorrect")
+            if body.new_password == body.current_password:
+                raise HTTPException(422, "Choose a password different from the current one")
+            changed_at = datetime.now(timezone.utc).replace(microsecond=0)
+            conn.execute(
+                text("UPDATE users SET password_hash = :p, must_change_password = FALSE, password_changed_at = :t "
+                     "WHERE user_id = :u"),
+                {"p": hash_password(body.new_password), "t": changed_at, "u": str(user.user_id)},
+            )
+        token = issue_token(user.user_id, user.org_id, user.role.value, user.email)
+        return TokenResponse(access_token=token, expires_in=settings.JWT_EXPIRE_MINUTES * 60, org_id=user.org_id,
+                             user_id=user.user_id, role=user.role, company_name=row["company_name"])
+
+    return await run_in_threadpool(run)
 
 
 @app.get(f"{P}/me", tags=["auth"])
@@ -587,7 +626,8 @@ async def create_user(body: UserCreate, user: CurrentUser = Depends(require_role
     try:
         row = await run_in_threadpool(
             _execute,
-            "INSERT INTO users (org_id, full_name, email, password_hash, role) VALUES (:o, :n, lower(:e), :p, :r) "
+            "INSERT INTO users (org_id, full_name, email, password_hash, role, must_change_password) "
+            "VALUES (:o, :n, lower(:e), :p, :r, TRUE) "
             "RETURNING user_id, full_name, email, role, created_at",
             {"o": str(user.org_id), "n": body.full_name, "e": body.email, "p": hash_password(body.password),
              "r": body.role.value},
@@ -630,7 +670,9 @@ async def update_user(user_id: UUID, body: UserUpdate, user: CurrentUser = Depen
                     UPDATE users
                        SET full_name = COALESCE(:n, full_name),
                            role = COALESCE(:r, role),
-                           password_hash = COALESCE(:p, password_hash)
+                           password_hash = COALESCE(:p, password_hash),
+                           must_change_password = CASE WHEN :p IS NULL THEN must_change_password ELSE TRUE END,
+                           password_changed_at = CASE WHEN :p IS NULL THEN password_changed_at ELSE now() END
                      WHERE user_id = :u AND org_id = :o
                     RETURNING user_id, full_name, email, role, created_at
                     """
@@ -659,6 +701,165 @@ async def remove_user(user_id: UUID, user: CurrentUser = Depends(require_roles(*
 
     await run_in_threadpool(run)
     return Response(status_code=204)
+
+
+# ----------------------------------------------------------------------------- email invitations
+_INVITE_COLUMNS = """invite_id, email, full_name, role, invited_by_email, send_count, last_sent_at, last_send_error,
+                     created_at, expires_at, accepted_at,
+                     CASE WHEN status = 'PENDING' AND expires_at < now() THEN 'EXPIRED' ELSE status END AS status"""
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _send_invite(invite_id: UUID, org_id: UUID, inviter_email: str) -> Dict[str, Any]:
+    """Rotate the invite's token, (re)send it and record the attempt. Returns the invite plus its link."""
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(days=settings.INVITE_EXPIRY_DAYS)
+    with engine.begin() as conn:
+        invite = conn.execute(
+            text("UPDATE invitations SET token_hash = :h, expires_at = :x WHERE invite_id = :i AND org_id = :o "
+                 "RETURNING email, full_name, role"),
+            {"h": _token_hash(token), "x": expires, "i": str(invite_id), "o": str(org_id)},
+        ).mappings().one()
+        company = conn.execute(text("SELECT company_name FROM organizations WHERE org_id = :o"),
+                               {"o": str(org_id)}).scalar_one()
+        inviter = conn.execute(text("SELECT full_name FROM users WHERE email = lower(:e)"),
+                               {"e": inviter_email}).scalar() or inviter_email
+    link = f"{settings.APP_BASE_URL.rstrip('/')}/invite?token={token}"
+    sent, error = mailer.send_invite(invite["email"], invite["full_name"], company, invite["role"], inviter,
+                                     link, expires)
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"UPDATE invitations SET send_count = send_count + CASE WHEN :s THEN 1 ELSE 0 END, "
+                 f"last_sent_at = CASE WHEN :s THEN now() ELSE last_sent_at END, last_send_error = :e "
+                 f"WHERE invite_id = :i RETURNING {_INVITE_COLUMNS}"),
+            {"s": sent, "e": error, "i": str(invite_id)},
+        ).mappings().one()
+    return {**row, "invite_url": link, "email_sent": sent, "email_error": error}
+
+
+@app.post(f"{P}/invites", response_model=InviteSent, status_code=201, tags=["auth"])
+async def create_invite(body: InviteCreate, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    """Invite someone by email. Any earlier pending invite for the same address is replaced."""
+    if body.role == UserRole.OWNER and user.role != UserRole.OWNER:
+        raise HTTPException(403, "Only an owner can invite another owner")
+
+    def run() -> Dict[str, Any]:
+        with engine.begin() as conn:
+            if conn.execute(text("SELECT 1 FROM users WHERE email = lower(:e)"), {"e": body.email}).scalar():
+                raise HTTPException(status.HTTP_409_CONFLICT, "This email already has an AuditX account")
+            conn.execute(
+                text("UPDATE invitations SET status = 'REVOKED', revoked_at = now() "
+                     "WHERE org_id = :o AND lower(email) = lower(:e) AND status = 'PENDING'"),
+                {"o": str(user.org_id), "e": body.email},
+            )
+            invite_id = conn.execute(
+                text("INSERT INTO invitations (org_id, email, full_name, role, token_hash, invited_by, invited_by_email, "
+                     "expires_at) VALUES (:o, lower(:e), :n, :r, :h, :u, :ue, now()) RETURNING invite_id"),
+                {"o": str(user.org_id), "e": body.email, "n": body.full_name, "r": body.role.value,
+                 "h": _token_hash(secrets.token_urlsafe(32)), "u": str(user.user_id), "ue": user.email},
+            ).scalar_one()
+        return _send_invite(invite_id, user.org_id, user.email)
+
+    return await run_in_threadpool(run)
+
+
+@app.get(f"{P}/invites", response_model=List[InviteOut], tags=["auth"])
+async def list_invites(
+    include_closed: bool = Query(False, description="Also return accepted and revoked invites"),
+    user: CurrentUser = Depends(require_roles(*ADMIN_ROLES)),
+) -> List[Dict[str, Any]]:
+    where = "org_id = :o" + ("" if include_closed else " AND status = 'PENDING'")
+    return await run_in_threadpool(
+        _fetch_all, f"SELECT {_INVITE_COLUMNS} FROM invitations WHERE {where} ORDER BY created_at DESC LIMIT 200",
+        {"o": str(user.org_id)},
+    )
+
+
+@app.post(f"{P}/invites/{{invite_id}}/resend", response_model=InviteSent, tags=["auth"])
+async def resend_invite(invite_id: UUID, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    """Send a fresh link (the old one stops working) and restart the expiry clock."""
+    def run() -> Dict[str, Any]:
+        row = _fetch_one("SELECT role, status FROM invitations WHERE invite_id = :i AND org_id = :o",
+                         {"i": str(invite_id), "o": str(user.org_id)})
+        if not row:
+            raise HTTPException(404, "Invite not found")
+        if row["status"] != "PENDING":
+            raise HTTPException(409, f"Invite is already {row['status'].lower()}")
+        if row["role"] == UserRole.OWNER.value and user.role != UserRole.OWNER:
+            raise HTTPException(403, "Only an owner can resend an owner invite")
+        return _send_invite(invite_id, user.org_id, user.email)
+
+    return await run_in_threadpool(run)
+
+
+@app.delete(f"{P}/invites/{{invite_id}}", status_code=204, response_class=Response, tags=["auth"])
+async def revoke_invite(invite_id: UUID, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Response:
+    row = await run_in_threadpool(
+        _execute,
+        "UPDATE invitations SET status = 'REVOKED', revoked_at = now() "
+        "WHERE invite_id = :i AND org_id = :o AND status = 'PENDING' RETURNING invite_id",
+        {"i": str(invite_id), "o": str(user.org_id)},
+    )
+    if not row:
+        raise HTTPException(404, "Pending invite not found")
+    return Response(status_code=204)
+
+
+def _open_invite(conn: Any, token: str, lock: bool = False) -> Dict[str, Any]:
+    row = conn.execute(
+        text("SELECT i.*, o.company_name FROM invitations i JOIN organizations o USING (org_id) "
+             "WHERE i.token_hash = :h" + (" FOR UPDATE OF i" if lock else "")),
+        {"h": _token_hash(token)},
+    ).mappings().first()
+    if not row or row["status"] == "REVOKED":
+        raise HTTPException(404, "This invitation link is not valid. Ask your admin for a new one.")
+    if row["status"] == "ACCEPTED":
+        raise HTTPException(409, "This invitation was already used. Sign in instead.")
+    if row["expires_at"] < datetime.now(timezone.utc):
+        raise HTTPException(410, "This invitation has expired. Ask your admin to resend it.")
+    return dict(row)
+
+
+@app.get(f"{P}/invites/token/{{token}}", response_model=InvitePublic, tags=["auth"])
+async def view_invite(token: str) -> Dict[str, Any]:
+    """Public: what the invite link is for, shown before the person sets a password."""
+    def run() -> Dict[str, Any]:
+        with engine.connect() as conn:
+            return _open_invite(conn, token)
+
+    return await run_in_threadpool(run)
+
+
+@app.post(f"{P}/invites/token/{{token}}/accept", response_model=TokenResponse, status_code=201, tags=["auth"])
+async def accept_invite(token: str, body: InviteAccept) -> TokenResponse:
+    """Public: create the account from an invite and sign the person in."""
+    def run() -> TokenResponse:
+        with engine.begin() as conn:
+            invite = _open_invite(conn, token, lock=True)
+            try:
+                with conn.begin_nested():
+                    user_id = conn.execute(
+                        text("INSERT INTO users (org_id, full_name, email, password_hash, role) "
+                             "VALUES (:o, :n, lower(:e), :p, :r) RETURNING user_id"),
+                        {"o": str(invite["org_id"]), "n": body.full_name, "e": invite["email"],
+                         "p": hash_password(body.password), "r": invite["role"]},
+                    ).scalar_one()
+            except IntegrityError as exc:
+                raise HTTPException(status.HTTP_409_CONFLICT, "This email already has an AuditX account") from exc
+            conn.execute(
+                text("UPDATE invitations SET status = 'ACCEPTED', accepted_at = now(), accepted_user_id = :u "
+                     "WHERE invite_id = :i"),
+                {"u": str(user_id), "i": str(invite["invite_id"])},
+            )
+        token_out = issue_token(user_id, invite["org_id"], invite["role"], invite["email"])
+        return TokenResponse(access_token=token_out, expires_in=settings.JWT_EXPIRE_MINUTES * 60,
+                             org_id=invite["org_id"], user_id=user_id, role=invite["role"],
+                             company_name=invite["company_name"])
+
+    return await run_in_threadpool(run)
 
 
 # ----------------------------------------------------------------------------- dashboard

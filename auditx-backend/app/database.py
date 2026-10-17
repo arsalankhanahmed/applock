@@ -226,6 +226,34 @@ CREATE TABLE IF NOT EXISTS approval_policies (
     updated_by_email          VARCHAR(320)
 );
 
+-- Passwords: an admin-set (temporary) password must be replaced at next sign-in; tokens issued before the
+-- last password change stop working.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ;
+
+-- Email invitations. Only a SHA-256 hash of the link token is stored.
+CREATE TABLE IF NOT EXISTS invitations (
+    invite_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id            UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    email             VARCHAR(320) NOT NULL,
+    full_name         VARCHAR(255),
+    role              VARCHAR(20) NOT NULL CHECK (role IN ('OWNER', 'ADMIN', 'ANALYST', 'AUDITOR', 'VIEWER')),
+    token_hash        CHAR(64) NOT NULL UNIQUE,
+    status            VARCHAR(12) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'ACCEPTED', 'REVOKED')),
+    invited_by        UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    invited_by_email  VARCHAR(320),
+    send_count        INT NOT NULL DEFAULT 0,
+    last_sent_at      TIMESTAMPTZ,
+    last_send_error   TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at        TIMESTAMPTZ NOT NULL,
+    accepted_at       TIMESTAMPTZ,
+    accepted_user_id  UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    revoked_at        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS ix_invitations_org ON invitations (org_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_invitations_email ON invitations (lower(email)) WHERE status = 'PENDING';
+
 ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS audit_jobs_job_type_check;
 ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS ck_audit_job_type;
 ALTER TABLE audit_jobs ADD CONSTRAINT ck_audit_job_type CHECK (job_type IN

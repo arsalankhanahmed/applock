@@ -22,6 +22,18 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
+      - key: APP_BASE_URL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
