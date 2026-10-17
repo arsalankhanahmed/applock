@@ -518,17 +518,21 @@ function LoginGate({ onAuthenticated }: { onAuthenticated: (s: Session) => void 
       <form onSubmit={submit} className="w-full max-w-sm rounded-2xl border border-ink-700 bg-ink-900 p-7 shadow-2xl shadow-black/50">
         <Logo />
         <p className="mt-2 text-sm text-slate-400">Sign in to the autonomous audit command center.</p>
-        <label className="mt-6 block text-xs font-medium uppercase tracking-wider text-slate-400">Work email</label>
+        <label htmlFor="login-email" className="mt-6 block text-xs font-medium uppercase tracking-wider text-slate-400">Work email</label>
         <input
+          id="login-email"
           type="email"
+          autoComplete="username"
           required
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           className="mt-1.5 w-full rounded-lg border border-ink-600 bg-ink-850 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-500"
         />
-        <label className="mt-4 block text-xs font-medium uppercase tracking-wider text-slate-400">Password</label>
+        <label htmlFor="login-password" className="mt-4 block text-xs font-medium uppercase tracking-wider text-slate-400">Password</label>
         <input
+          id="login-password"
           type="password"
+          autoComplete="current-password"
           required
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -954,8 +958,9 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
       title="Discrepancy Tracking Matrix"
       action={
         <div className="flex flex-wrap items-center gap-2">
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search order / ref" className={`${select} w-36`} />
+          <input value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search findings" placeholder="Search order / ref" className={`${select} w-36`} />
           <select
+            aria-label="Channel filter"
             value={channel}
             onChange={(e) => {
               setChannel(e.target.value as Channel | "");
@@ -970,13 +975,13 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
               </option>
             ))}
           </select>
-          <select value={status} onChange={(e) => setStatus(e.target.value as DiscrepancyStatus | "")} className={select}>
+          <select aria-label="Status filter" value={status} onChange={(e) => setStatus(e.target.value as DiscrepancyStatus | "")} className={select}>
             <option value="">All statuses</option>
             <option value="UNRESOLVED">Unresolved</option>
             <option value="PENDING_APPROVAL">Pending approval</option>
             <option value="RESOLVED">Resolved</option>
           </select>
-          <select value={issue} onChange={(e) => setIssue(e.target.value as IssueType | "")} className={select}>
+          <select aria-label="Issue type filter" value={issue} onChange={(e) => setIssue(e.target.value as IssueType | "")} className={select}>
             <option value="">All issue types</option>
             {(Object.keys(CHANNEL_META) as Channel[])
               .filter((ch) => !channel || ch === channel)
@@ -1337,13 +1342,13 @@ function ApprovalsInbox({
               {integer(page.total)} pending · {money(page.pending_value, currency, true)}
             </Badge>
           )}
-          <select value={status} onChange={(e) => setStatus(e.target.value as RequestStatus)} className={select}>
+          <select aria-label="Approval status filter" value={status} onChange={(e) => setStatus(e.target.value as RequestStatus)} className={select}>
             <option value="PENDING">Pending</option>
             <option value="APPROVED">Approved</option>
             <option value="REJECTED">Rejected</option>
             <option value="WITHDRAWN">Withdrawn</option>
           </select>
-          <select value={maker} onChange={(e) => setMaker(e.target.value as "" | "AI" | "USER")} className={select}>
+          <select aria-label="Proposed by filter" value={maker} onChange={(e) => setMaker(e.target.value as "" | "AI" | "USER")} className={select}>
             <option value="">AI and people</option>
             <option value="AI">AI Auto-Healer</option>
             <option value="USER">People</option>
@@ -2089,6 +2094,7 @@ function ForensicChat({ token }: { token: string }) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             disabled={busy}
+            aria-label="Question for the forensic agent"
             placeholder="e.g. Which orders over $500 have no payment?"
             className="flex-1 rounded-lg border border-ink-600 bg-ink-850 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-emerald-500 disabled:opacity-60"
           />

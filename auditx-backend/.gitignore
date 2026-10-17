@@ -5,3 +5,7 @@ venv/
 uploads/
 samples/
 dump.rdb
+.coverage
+coverage.xml
+pytest-report.xml
+htmlcov/

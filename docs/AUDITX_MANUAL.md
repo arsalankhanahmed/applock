@@ -459,3 +459,21 @@ so only enable it during pilot weeks.
 * Terminate TLS at the platform edge (Render / Vercel do this automatically).
 * Back up PostgreSQL (Neon has point-in-time restore. Locally, use `pg_dump`).
 * Monitor `audit_jobs` for `FAILED` rows and the Celery worker logs.
+
+## 9. Automated testing
+
+The full test pack is in [`docs/testing/`](testing/): [strategy](testing/TEST_STRATEGY.md), [use cases](testing/USE_CASES.md), [business test cases](testing/BUSINESS_TEST_CASES.md) and the latest [test report](testing/TEST_REPORT.md).
+
+```bash
+# Backend: unit, integration, black-box API and regression (277 tests, ~1 min)
+createdb -U auditx auditx_test                 # once; the suite refuses any database not named auditx_test
+cd auditx-backend && pip install -r requirements-dev.txt
+pytest                                         # or: pytest -m unit | integration | api | regression
+pytest --cov=app --cov-report=term-missing
+
+# UI end-to-end (Playwright) against a running stack
+cd auditx-frontend && npm ci && npx playwright install chromium
+E2E_BASE_URL=http://localhost:3000 E2E_API_URL=http://localhost:8000 npx playwright test
+```
+
+GitHub Actions (`.github/workflows/auditx-ci.yml`) runs the backend suite against PostgreSQL, plus frontend typecheck, lint and build, on every push.
