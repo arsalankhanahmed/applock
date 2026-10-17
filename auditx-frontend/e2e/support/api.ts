@@ -49,6 +49,11 @@ export async function addActiveMember(request: APIRequestContext, ownerToken: st
   }));
 }
 
+/** Uploads one of the e2e/test-data files and waits until it is ingested (e.g. a courier's updated report). */
+export async function uploadTestFile(request: APIRequestContext, token: string, target: string, file: string) {
+  await upload(request, token, target, readFileSync(join(DATA_DIR, file), "utf8"));
+}
+
 async function upload(request: APIRequestContext, token: string, target: string, csv: string) {
   const res = await request.post(`${API}/api/v1/ingest/${target}`, {
     headers: bearer(token),

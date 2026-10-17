@@ -231,3 +231,24 @@ def test_every_planted_anomaly_is_found_exactly_once(db, seed, fx_noise):
     assert actual == expected
     assert found == {}                                          # no false positives in any other category
     assert sum(planted.values()) > 100                          # the seed really did plant a dirty dataset
+
+
+# ----------------------------------------------------------------------------- recovery & claims
+def test_def10_claim_timeline_keeps_the_order_of_same_transaction_events(client, monkeypatch):
+    """DEF-10: SUBMITTED and EMAILED were written in one transaction with now(), so the timeline order was random."""
+    from app.services import mailer
+    from tests.api.test_ingest_recon_api import full_dataset
+
+    monkeypatch.setattr(mailer, "send_claim", lambda *a, **k: (True, None))
+    token = register(client)["access_token"]
+    full_dataset(client, token)
+    client.post("/api/v1/reconciliation/run", headers=auth(token))
+    ids = [i["log_id"] for i in client.get("/api/v1/recovery/claimable", headers=auth(token)).json()[0]["items"]]
+    cid = client.post("/api/v1/claims", headers=auth(token), json={"log_ids": ids}).json()["claim_id"]
+    for _ in range(5):                                   # random UUID tie-breaks would fail within a few tries
+        client.post(f"/api/v1/claims/{cid}/cancel", headers=auth(token))
+        cid = client.post("/api/v1/claims", headers=auth(token), json={"log_ids": ids}).json()["claim_id"]
+        events = client.post(f"/api/v1/claims/{cid}/submit", headers=auth(token),
+                             json={"send_email": True, "counterparty_contact": "c@tcs.example.com"}).json()["events"]
+        assert [e["kind"] for e in events] == ["CREATED", "SUBMITTED", "EMAILED"]
+        client.post(f"/api/v1/claims/{cid}/reject", headers=auth(token), json={"note": "reset for next round"})

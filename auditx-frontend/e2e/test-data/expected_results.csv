@@ -7,3 +7,4 @@ O1,GATEWAY,— (matched),100.00,100.00,0.00,—,—,Clean order: no finding
 C1,COD,— (matched),60.00,60.00,0.00,—,—,Delivered and remitted under CPR-1 (57.50 = 60.00 - 2.50 charges)
 po_A,BANK,— (matched),209.80,209.80,0.00,—,—,Payout = (100-3.20)+(42-1.52)+(75-2.48) = 209.80 found in bank by reference
 CPR-1,BANK,— (matched),57.50,57.50,0.00,—,—,Courier remittance found in bank by reference
+C2 (after 05/06 upload),COD,— (recovered),70.00,67.50,0.00,—,—,Courier's updated report remits C2 under CPR-2 and the bank shows 67.50: an open claim for C2 is credited automatically

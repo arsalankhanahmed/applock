@@ -1,4 +1,4 @@
-"""Outgoing email (team invitations) over plain SMTP.
+"""Outgoing email (team invitations and recovery claim letters) over plain SMTP.
 
 Works with any SMTP provider: Gmail / Google Workspace (app password), Microsoft 365, Brevo, Mailgun,
 Amazon SES, Resend's SMTP relay, or a local catcher such as Mailpit in development. When SMTP_HOST is empty
@@ -32,9 +32,9 @@ def email_configured() -> bool:
     return bool(settings.SMTP_HOST)
 
 
-def _send(message: EmailMessage) -> Tuple[bool, Optional[str]]:
+def _send(message: EmailMessage, fallback: str = "share the invite link instead") -> Tuple[bool, Optional[str]]:
     if not email_configured():
-        return False, "Email is not configured (SMTP_HOST is empty); share the invite link instead."
+        return False, f"Email is not configured (SMTP_HOST is empty); {fallback}."
     try:
         if settings.SMTP_SSL:
             server: smtplib.SMTP = smtplib.SMTP_SSL(
@@ -52,7 +52,7 @@ def _send(message: EmailMessage) -> Tuple[bool, Optional[str]]:
         return True, None
     except (smtplib.SMTPException, OSError) as exc:
         logger.warning("Email to %s failed: %s", message["To"], exc)
-        return False, f"Email could not be sent ({type(exc).__name__}: {exc}); share the invite link instead."
+        return False, f"Email could not be sent ({type(exc).__name__}: {exc}); {fallback}."
 
 
 def send_invite(
@@ -101,3 +101,17 @@ def send_invite(
     message.set_content(text)
     message.add_alternative(body_html, subtype="html")
     return _send(message)
+
+
+def send_claim(to: str, subject: str, text: str, body_html: str, reply_to: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """Send a recovery claim letter to a courier, gateway or bank. Returns (sent, error)."""
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = settings.SMTP_FROM
+    message["To"] = to
+    if reply_to:
+        message["Reply-To"] = reply_to
+    message["Message-ID"] = make_msgid(domain="auditx")
+    message.set_content(text)
+    message.add_alternative(body_html, subtype="html")
+    return _send(message, fallback="copy or print the claim letter instead")

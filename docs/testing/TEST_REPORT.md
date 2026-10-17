@@ -2,27 +2,39 @@
 
 | Item | Value |
 |---|---|
-| Build under test | branch `ccr-4b6a270d-we3a5h` (AuditX 1.0.0) |
+| Build under test | branch `ccr-4b6a270d-we3a5h` (AuditX 1.0.0 + Recovery & Claims) |
 | Test date | 2026-10-17 |
 | Environment | Linux, Python 3.13, PostgreSQL 16, Redis 7, Celery 5 (eager for backend tests, real worker for UI tests), Node 20, Next.js 14.2, Chromium (Playwright 1.56.1) |
 | Strategy | [TEST_STRATEGY.md](TEST_STRATEGY.md) · cases: [USE_CASES.md](USE_CASES.md), [BUSINESS_TEST_CASES.md](BUSINESS_TEST_CASES.md) |
 
 ## 1. Summary
 
-**All 293 automated tests pass.** Testing found **9 defects** (3 High, 3 Medium, 3 Low). All are fixed and each has a regression test. There are no open defects.
+**All 333 automated tests pass.** Testing found **11 defects** (3 High, 3 Medium, 5 Low). All are fixed and each has a regression test. There are no open defects.
 
 | Suite | Kind | Tests | Passed | Failed | Time |
 |---|---|---:|---:|---:|---:|
-| `tests/unit` | White box | 160 | 160 | 0 | 2.0 s |
-| `tests/integration` | Integration with PostgreSQL | 41 | 41 | 0 | 9.5 s |
-| `tests/api` | Black box (HTTP) | 50 | 50 | 0 | 31.2 s |
-| `tests/regression` | Regression and planted-vs-found | 26 | 26 | 0 | 5.8 s |
-| **Backend total** | | **277** | **277** | **0** | 52 s |
-| `auditx-frontend/e2e` | Black-box UI, desktop Chromium | 15 | 15 | 0 | 33 s (two consecutive runs) |
+| `tests/unit` | White box | 171 | 171 | 0 | 2.1 s |
+| `tests/integration` | Integration with PostgreSQL | 55 | 55 | 0 | 16 s |
+| `tests/api` | Black box (HTTP) | 60 | 60 | 0 | 52.0 s |
+| `tests/regression` | Regression and planted-vs-found | 27 | 27 | 0 | 7.1 s |
+| **Backend total** | | **313** | **313** | **0** | 85 s |
+| `auditx-frontend/e2e` | Black-box UI, desktop Chromium | 19 | 19 | 0 | 48 s (full suite run 3 times, the last on the final build) |
 | `auditx-frontend/e2e` | Black-box UI, mobile (Pixel 7) | 1 | 1 | 0 | |
-| **Grand total** | | **293** | **293** | **0** | |
+| **Grand total** | | **333** | **333** | **0** | |
 
-Business test cases BTC-01 to BTC-34 all **pass** ([traceability](BUSINESS_TEST_CASES.md)).
+Business test cases BTC-01 to BTC-45 all **pass** ([traceability](BUSINESS_TEST_CASES.md)).
+
+**Recovery & Claims (this release)** adds 40 tests: 11 unit, 14 integration, 10 API, 1 regression and 4 UI scenarios (UC-14 to UC-16, BTC-35 to BTC-45). They cover:
+- claimable rules;
+- the claim letter, including HTML escaping;
+- the full claim lifecycle;
+- overpayment caps;
+- maker-checker on close-out;
+- email and its fallback;
+- automatic recovery from fresh courier and bank data, including part payments and no double counting;
+- tenant isolation;
+- roles;
+- a failing recovery check not failing reconciliation.
 
 Static checks: `tsc --noEmit` is clean, `next lint` reports no warnings or errors, and `next build` succeeds.
 
@@ -33,18 +45,19 @@ Static checks: `tsc --noEmit` is clean, `next lint` reports no warnings or error
 | services/approvals.py | 88 | 0 | **100%** |
 | services/bank_reconciliation.py | 93 | 0 | **100%** |
 | services/cod_reconciliation.py | 84 | 0 | **100%** |
-| models/schemas.py | 312 | 0 | **100%** |
+| models/schemas.py | 426 | 0 | **100%** |
+| services/recovery.py *(new)* | 311 | 9 | 97% |
 | services/auto_healer.py | 261 | 7 | 97% |
-| services/reconciliation.py | 114 | 3 | 97% |
+| services/reconciliation.py | 117 | 3 | 97% |
 | config.py | 67 | 2 | 97% |
-| services/mailer.py | 46 | 2 | 96% |
+| services/mailer.py | 57 | 2 | 96% |
 | services/parser.py | 320 | 17 | 95% |
-| main.py | 472 | 33 | 93% |
+| main.py | 523 | 33 | 94% |
 | utils/seeder.py | 331 | 30 | 91% |
 | workers/tasks.py | 55 | 6 | 89% |
 | services/ai_agent.py | 178 | 25 | 86% (the uncovered lines are the live OpenAI HTTP calls, which are mocked) |
 | database.py | 36 | 14 | 61% (engine and pool bootstrapping) |
-| **Total** | **2457** | **139** | **94%** |
+| **Total** | **2947** | **148** | **95%** |
 
 The exit criterion "`app/services` ≥ 85%" is met: every service module is between 86% and 100%.
 
@@ -61,6 +74,10 @@ The exit criterion "`app/services` ≥ 85%" is met: every service module is betw
 | DEF-07 | Medium | Ad-hoc | A single identifier longer than 128 characters aborted the PostgreSQL COPY, so the **whole file** failed. | Rows with text longer than the column width are rejected individually and counted | `test_def07_overlong_identifier_rejects_the_row_not_the_file` |
 | DEF-08 | Low | Ad-hoc | UTF-16 files (Excel's "Unicode Text" export) failed with a misleading "missing columns" error. | Detect the UTF-16 BOM and read the file as UTF-16 | `test_def08_utf16_excel_exports_are_readable` |
 | DEF-09 | Low (accessibility) | UI automation | The login fields, matrix filters, approval filters and chat input had no accessible names, so screen readers announced unlabelled controls. | `htmlFor`/`id` on the login fields, `aria-label` on the filters and chat input | Every UI spec locates these controls by label (`getByLabel`) |
+| DEF-10 | Low | API (black box) | A claim's timeline showed *Sent* and *Letter emailed* in random order: both events were written in one transaction with `now()` and tie-broken by a random UUID. | Events are stamped with `clock_timestamp()` | `test_def10_claim_timeline_keeps_the_order_of_same_transaction_events` |
+| DEF-11 | Low (usability) | UI automation | Recording the final payment moved the claim out of the "Open claims" list, so it vanished while the user was still looking at it. | The list switches to "All claims" when the open claim closes; changing the filter by hand collapses the detail | `e2e/recovery.spec.ts` UC-15 / UC-16 |
+
+A design risk in automatic recovery was covered by tests before it could become a defect. A part payment turns an unpaid COD order (`COD_NOT_REMITTED`) into a smaller `COD_REMITTANCE_SHORTFALL`, and matching on issue type alone would have counted the order as fully recovered. Claims therefore match on channel and reference across claimable types, and credit only the difference (`test_partial_payment_in_the_data_is_not_mistaken_for_full_recovery`).
 
 Earlier defects found during development are also pinned in `tests/regression`: the 204 DELETE route crashing startup, a removed member's token still working, a rejected AI fix being re-proposed, duplicates on re-run, COD orders reported as missing card payments, and the status CHECK constraint missing `PENDING_APPROVAL`.
 

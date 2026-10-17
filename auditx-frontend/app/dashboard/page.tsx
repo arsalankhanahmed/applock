@@ -255,6 +255,7 @@ interface Discrepancy {
   auto_resolved: boolean;
   detected_at: string;
   resolved_at: string | null;
+  claim_number?: string | null;
 }
 
 interface DiscrepancyPage {
@@ -1051,7 +1052,9 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
                           <ConfidenceMeter value={d.ai_confidence_score} />
                         </td>
                         <td className="px-5 py-2.5 text-right">
-                          {d.status === "PENDING_APPROVAL" ? (
+                          {d.claim_number && d.status === "UNRESOLVED" ? (
+                            <Badge className={TONE.sky}>Claimed · {d.claim_number}</Badge>
+                          ) : d.status === "PENDING_APPROVAL" ? (
                             <Badge className={TONE.amber}>Awaiting checker</Badge>
                           ) : d.status === "RESOLVED" ? (
                             <Badge className="text-emerald-300 bg-emerald-500/10 ring-emerald-500/30">{d.auto_resolved ? "Auto-healed" : "Resolved"}</Badge>
@@ -1228,6 +1231,603 @@ function PolicyEditor({ token, canEdit, currency }: { token: string; canEdit: bo
         )}
       </div>
       {message && <p className="mt-2 text-slate-300">{message}</p>}
+    </div>
+  );
+}
+
+/* ============================================================================
+ * Recovery & claims
+ * ========================================================================== */
+type ClaimStatus = "DRAFT" | "SUBMITTED" | "PARTIALLY_RECOVERED" | "RECOVERED" | "REJECTED" | "WRITTEN_OFF" | "CANCELLED";
+type CounterpartyType = "COURIER" | "GATEWAY" | "BANK";
+
+interface ClaimableFinding {
+  log_id: string;
+  source_order_number: string;
+  issue_type: IssueType;
+  channel: Channel;
+  amount: Money;
+  root_cause_category: string | null;
+  counterparty_type: CounterpartyType;
+  counterparty_name: string;
+  evidence: Record<string, string | number | null>;
+}
+
+interface ClaimableGroup {
+  counterparty_type: CounterpartyType;
+  counterparty_name: string;
+  total: Money;
+  count: number;
+  items: ClaimableFinding[];
+}
+
+interface ClaimRow {
+  claim_id: string;
+  claim_number: string;
+  counterparty_type: CounterpartyType;
+  counterparty_name: string;
+  counterparty_contact: string | null;
+  currency: string;
+  status: ClaimStatus;
+  claimed_amount: Money;
+  recovered_amount: Money;
+  written_off_amount: Money;
+  outstanding_amount: Money;
+  due_date: string | null;
+  created_at: string;
+  submitted_at: string | null;
+  item_count?: number | null;
+}
+
+interface ClaimItem {
+  item_id: string;
+  source_order_number: string;
+  issue_type: IssueType;
+  channel: Channel;
+  amount: Money;
+  evidence: Record<string, string | number | null>;
+  data_cleared_amount: Money;
+  active: boolean;
+  finding_status: string | null;
+}
+
+interface ClaimEvent {
+  event_id: string;
+  kind: string;
+  amount: Money | null;
+  reference: string | null;
+  note: string | null;
+  actor_email: string | null;
+  occurred_on: string;
+  created_at: string;
+}
+
+interface ClaimDetail extends ClaimRow {
+  items: ClaimItem[];
+  events: ClaimEvent[];
+  letter_subject: string;
+  letter_text: string;
+  email_sent?: boolean | null;
+  email_error?: string | null;
+  resolutions?: { source_order_number: string; status: string }[];
+}
+
+interface ClaimPageData {
+  total: number;
+  items: ClaimRow[];
+}
+
+interface RecoverySummaryData {
+  currency: string;
+  claimable_count: number;
+  claimable_value: Money;
+  open_claims: number;
+  open_value: Money;
+  recovered_total: Money;
+  recovered_this_month: Money;
+  written_off_total: Money;
+  recovery_rate_pct: Money | null;
+}
+
+const CLAIM_META: Record<ClaimStatus, { label: string; tone: string }> = {
+  DRAFT: { label: "Draft", tone: "text-slate-300 bg-slate-500/10 ring-slate-500/30" },
+  SUBMITTED: { label: "Sent", tone: TONE.sky },
+  PARTIALLY_RECOVERED: { label: "Partly recovered", tone: TONE.amber },
+  RECOVERED: { label: "Recovered", tone: "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30" },
+  REJECTED: { label: "Rejected", tone: TONE.rose },
+  WRITTEN_OFF: { label: "Written off", tone: TONE.violet },
+  CANCELLED: { label: "Cancelled", tone: "text-slate-400 bg-slate-500/10 ring-slate-500/30" },
+};
+
+const plural = (n: number, word: string): string => `${integer(n)} ${word}${n === 1 ? "" : "s"}`;
+
+const OPEN_CLAIM_STATUSES: ClaimStatus[] = ["DRAFT", "SUBMITTED", "PARTIALLY_RECOVERED"];
+
+const EVENT_LABEL: Record<string, string> = {
+  CREATED: "Claim drafted",
+  SUBMITTED: "Sent to counterparty",
+  EMAILED: "Letter emailed",
+  PAYMENT: "Payment received",
+  DATA_MATCH: "Payment seen in courier / bank data",
+  REJECTED: "Rejected by counterparty",
+  WRITTEN_OFF: "Balance written off",
+  CANCELLED: "Draft cancelled",
+};
+
+function RecoveryPanel({
+  token,
+  refreshKey,
+  canWrite,
+  onChanged,
+}: {
+  token: string;
+  refreshKey: number;
+  canWrite: boolean;
+  onChanged: () => void;
+}) {
+  const [tab, setTab] = useState<"claimable" | "claims">("claimable");
+  const [summary, setSummary] = useState<RecoverySummaryData | null>(null);
+  const [groups, setGroups] = useState<ClaimableGroup[] | null>(null);
+  const [claims, setClaims] = useState<ClaimPageData | null>(null);
+  const [claimFilter, setClaimFilter] = useState<string>("OPEN");
+  const [openClaim, setOpenClaim] = useState<string | null>(null);
+  const [excluded, setExcluded] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [localKey, setLocalKey] = useState(0);
+
+  const reload = useCallback(() => setLocalKey((k) => k + 1), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const params = new URLSearchParams({ limit: "50" });
+    if (claimFilter) params.set("status", claimFilter);
+    Promise.all([
+      api<RecoverySummaryData>("/api/v1/recovery/summary", token),
+      api<ClaimableGroup[]>("/api/v1/recovery/claimable", token),
+      api<ClaimPageData>(`/api/v1/claims?${params.toString()}`, token),
+    ])
+      .then(([s, g, c]) => {
+        if (cancelled) return;
+        setSummary(s);
+        setGroups(g);
+        setClaims(c);
+      })
+      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "Could not load recovery"));
+    return () => {
+      cancelled = true;
+    };
+  }, [token, refreshKey, localKey, claimFilter]);
+
+  const currency = summary?.currency ?? "USD";
+
+  async function createClaim(group: ClaimableGroup) {
+    const ids = group.items.filter((i) => !excluded.has(i.log_id)).map((i) => i.log_id);
+    if (ids.length === 0) return;
+    setBusy(group.counterparty_name);
+    setError(null);
+    try {
+      const claim = await api<ClaimDetail>("/api/v1/claims", token, { method: "POST", body: JSON.stringify({ log_ids: ids }) });
+      setNotice(`${claim.claim_number} drafted for ${claim.counterparty_name}: ${money(claim.claimed_amount, currency)}.`);
+      setTab("claims");
+      setClaimFilter("OPEN");
+      setOpenClaim(claim.claim_id);
+      reload();
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not create the claim");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const tile = (label: string, value: string, sub: string, tone: string) => (
+    <div className="rounded-xl border border-ink-700 bg-ink-850/60 px-3 py-2.5">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">{label}</p>
+      <p className={`tabular mt-1 text-lg font-semibold ${tone}`}>{value}</p>
+      <p className="text-[11px] text-slate-500">{sub}</p>
+    </div>
+  );
+  const tabClass = (on: boolean) =>
+    `rounded-md px-2.5 py-1 text-xs ${on ? "bg-ink-700 text-slate-100" : "text-slate-400 hover:text-slate-200"}`;
+
+  return (
+    <Card
+      title="Recovery & Claims"
+      action={
+        <div className="flex flex-wrap items-center gap-2">
+          {summary && (
+            <Badge className="text-emerald-300 bg-emerald-500/10 ring-emerald-500/30">
+              {money(summary.recovered_this_month, currency)} recovered this month
+            </Badge>
+          )}
+          <div className="inline-flex rounded-lg border border-ink-600 p-0.5" role="tablist">
+            <button role="tab" aria-selected={tab === "claimable"} onClick={() => setTab("claimable")} className={tabClass(tab === "claimable")}>
+              Claimable ({summary?.claimable_count ?? 0})
+            </button>
+            <button role="tab" aria-selected={tab === "claims"} onClick={() => setTab("claims")} className={tabClass(tab === "claims")}>
+              Claims ({summary?.open_claims ?? 0} open)
+            </button>
+          </div>
+        </div>
+      }
+    >
+      {summary ? (
+        <div className="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+          {tile("Recovered this month", money(summary.recovered_this_month, currency), "payments + matches in data", "text-emerald-300")}
+          {tile(
+            "Recovered to date",
+            money(summary.recovered_total, currency),
+            summary.recovery_rate_pct === null ? "no claims sent yet" : `${pct(summary.recovery_rate_pct)} of amounts claimed`,
+            "text-emerald-300",
+          )}
+          {tile("Out with counterparties", money(summary.open_value, currency), plural(summary.open_claims, "open claim"), "text-amber-300")}
+          {tile("Claimable now", money(summary.claimable_value, currency), plural(summary.claimable_count, "finding"), "text-rose-300")}
+        </div>
+      ) : (
+        <Skeleton className="mb-4 h-16" />
+      )}
+      {error && <p className="mb-3 rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
+      {notice && <p className="mb-3 rounded-md bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">{notice}</p>}
+
+      {tab === "claimable" ? (
+        !groups ? (
+          <Skeleton className="h-24" />
+        ) : groups.length === 0 ? (
+          <p className="py-6 text-center text-sm text-slate-500">Nothing to claim: no courier, gateway or bank owes you money right now.</p>
+        ) : (
+          <div className="space-y-3">
+            {groups.map((g) => {
+              const chosen = g.items.filter((i) => !excluded.has(i.log_id));
+              const chosenTotal = chosen.reduce((sum, i) => sum + num(i.amount), 0);
+              return (
+                <div key={`${g.counterparty_type}:${g.counterparty_name}`} className="rounded-xl border border-ink-700" data-testid="claimable-group">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-ink-700 px-4 py-2.5">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-100">{g.counterparty_name}</p>
+                      <p className="text-[11px] text-slate-500">
+                        {humanize(g.counterparty_type)} · {plural(g.count, "finding")} · {money(g.total, currency)} owed
+                      </p>
+                    </div>
+                    {canWrite && (
+                      <button
+                        onClick={() => void createClaim(g)}
+                        disabled={chosen.length === 0 || busy === g.counterparty_name}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1 text-xs font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-50"
+                      >
+                        {busy === g.counterparty_name && <Spinner className="h-3 w-3" />} Create claim ({money(chosenTotal, currency)})
+                      </button>
+                    )}
+                  </div>
+                  <ul className="divide-y divide-ink-800 text-xs">
+                    {g.items.map((i) => (
+                      <li key={i.log_id} className="flex items-center gap-3 px-4 py-2">
+                        {canWrite && (
+                          <input
+                            type="checkbox"
+                            aria-label={`Include ${i.source_order_number}`}
+                            checked={!excluded.has(i.log_id)}
+                            onChange={() =>
+                              setExcluded((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(i.log_id)) next.delete(i.log_id);
+                                else next.add(i.log_id);
+                                return next;
+                              })
+                            }
+                            className="h-4 w-4 accent-emerald-500"
+                          />
+                        )}
+                        <span className="w-24 font-mono text-slate-200">{i.source_order_number}</span>
+                        <Badge className={ISSUE_META[i.issue_type].tone}>{ISSUE_META[i.issue_type].label}</Badge>
+                        <span className="hidden flex-1 truncate text-slate-500 md:block">
+                          {i.evidence.tracking_number ? `CN ${i.evidence.tracking_number}` : ""}
+                          {i.evidence.delivered_at ? ` · delivered ${String(i.evidence.delivered_at).slice(0, 10)}` : ""}
+                        </span>
+                        <span className="tabular ml-auto text-slate-200">{money(i.amount, currency)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        )
+      ) : (
+        <div>
+          <div className="mb-3 flex items-center justify-between">
+            <select
+              aria-label="Claim status filter"
+              value={claimFilter}
+              onChange={(e) => {
+                setClaimFilter(e.target.value);
+                setOpenClaim(null);
+              }}
+              className="rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-emerald-500"
+            >
+              <option value="OPEN">Open claims</option>
+              <option value="">All claims</option>
+              {(Object.keys(CLAIM_META) as ClaimStatus[]).map((s) => (
+                <option key={s} value={s}>
+                  {CLAIM_META[s].label}
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-slate-500">{claims ? plural(claims.total, "claim") : ""}</span>
+          </div>
+          {!claims ? (
+            <Skeleton className="h-24" />
+          ) : claims.items.length === 0 ? (
+            <p className="py-6 text-center text-sm text-slate-500">No claims here yet. Create one from the Claimable tab.</p>
+          ) : (
+            <ul className="divide-y divide-ink-700 rounded-xl border border-ink-700">
+              {claims.items.map((c) => (
+                <li key={c.claim_id} data-testid="claim-row">
+                  <button
+                    onClick={() => setOpenClaim(openClaim === c.claim_id ? null : c.claim_id)}
+                    className="flex w-full flex-wrap items-center gap-3 px-4 py-2.5 text-left text-xs hover:bg-ink-850"
+                  >
+                    <span className="font-mono text-slate-200">{c.claim_number}</span>
+                    <span className="font-medium text-slate-100">{c.counterparty_name}</span>
+                    <Badge className={CLAIM_META[c.status].tone}>{CLAIM_META[c.status].label}</Badge>
+                    <span className="tabular ml-auto text-slate-400">
+                      claimed {money(c.claimed_amount, currency)} · recovered{" "}
+                      <span className="text-emerald-300">{money(c.recovered_amount, currency)}</span>
+                    </span>
+                  </button>
+                  {openClaim === c.claim_id && (
+                    <PanelBoundary title="Claim">
+                      <ClaimView
+                        token={token}
+                        claimId={c.claim_id}
+                        canWrite={canWrite}
+                        onChanged={(message, status) => {
+                          setNotice(message);
+                          // Keep a claim the user is working on in view after it closes (recovered, written off…).
+                          if (claimFilter === "OPEN" && !OPEN_CLAIM_STATUSES.includes(status)) setClaimFilter("");
+                          reload();
+                          onChanged();
+                        }}
+                      />
+                    </PanelBoundary>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ClaimView({
+  token,
+  claimId,
+  canWrite,
+  onChanged,
+}: {
+  token: string;
+  claimId: string;
+  canWrite: boolean;
+  onChanged: (message: string, status: ClaimStatus) => void;
+}) {
+  const [claim, setClaim] = useState<ClaimDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [contact, setContact] = useState("");
+  const [amount, setAmount] = useState("");
+  const [reference, setReference] = useState("");
+  const [showLetter, setShowLetter] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const load = useCallback(() => {
+    api<ClaimDetail>(`/api/v1/claims/${claimId}`, token)
+      .then((c) => {
+        setClaim(c);
+        setContact(c.counterparty_contact ?? "");
+        setAmount(num(c.outstanding_amount).toFixed(2));
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : "Could not load the claim"));
+  }, [claimId, token]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function act(name: string, path: string, body: unknown, describe: (c: ClaimDetail) => string) {
+    setBusy(name);
+    setError(null);
+    try {
+      const updated = await api<ClaimDetail>(`/api/v1/claims/${claimId}/${path}`, token, {
+        method: "POST",
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      setClaim(updated);
+      setAmount(num(updated.outstanding_amount).toFixed(2));
+      setReference("");
+      onChanged(describe(updated), updated.status);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Action failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function sentToCheckers(c: ClaimDetail): string {
+    const pending = (c.resolutions ?? []).filter((r) => r.status === "PENDING_APPROVAL").length;
+    return pending ? ` ${plural(pending, "finding")} sent to a checker to close.` : "";
+  }
+
+  async function printLetter() {
+    const letter = await api<{ subject: string; html: string }>(`/api/v1/claims/${claimId}/letter`, token);
+    const w = window.open("", "_blank");
+    if (!w) return;
+    w.document.write(`<!doctype html><title>${letter.subject.replace(/</g, "&lt;")}</title>${letter.html}`);
+    w.document.close();
+    w.focus();
+    w.print();
+  }
+
+  if (error && !claim) return <p className="px-4 pb-3 text-xs text-rose-300">{error}</p>;
+  if (!claim) return <Skeleton className="mx-4 mb-3 h-16" />;
+  const c = claim.currency;
+  const collecting = claim.status === "SUBMITTED" || claim.status === "PARTIALLY_RECOVERED";
+  const field = "rounded-md border border-ink-600 bg-ink-850 px-2 py-1 text-xs text-slate-100 outline-none focus:border-emerald-500";
+  const button = "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] disabled:opacity-50";
+
+  return (
+    <div className="space-y-3 bg-ink-950/60 px-4 pb-4 pt-2 text-xs" data-testid="claim-detail">
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+        <p className="text-slate-400">Claimed <span className="tabular block text-sm text-slate-100">{money(claim.claimed_amount, c)}</span></p>
+        <p className="text-slate-400">Recovered <span className="tabular block text-sm text-emerald-300">{money(claim.recovered_amount, c)}</span></p>
+        <p className="text-slate-400">Outstanding <span className="tabular block text-sm text-amber-300">{money(claim.outstanding_amount, c)}</span></p>
+        <p className="text-slate-400">Due <span className="block text-sm text-slate-100">{claim.due_date ?? "—"}</span></p>
+      </div>
+
+      <table className="w-full">
+        <tbody>
+          {claim.items.map((i) => (
+            <tr key={i.item_id} className="border-b border-ink-800">
+              <td className="py-1.5 font-mono text-slate-200">{i.source_order_number}</td>
+              <td className="py-1.5">
+                <Badge className={ISSUE_META[i.issue_type].tone}>{ISSUE_META[i.issue_type].label}</Badge>
+              </td>
+              <td className="py-1.5 text-slate-500">{i.finding_status ? humanize(i.finding_status) : "Cleared in data"}</td>
+              <td className="tabular py-1.5 text-right text-slate-200">{money(i.amount, c)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {error && <p className="rounded-md bg-rose-500/10 px-3 py-2 text-rose-300">{error}</p>}
+      {claim.email_error && <p className="rounded-md bg-amber-500/10 px-3 py-2 text-amber-200">{claim.email_error}</p>}
+
+      {canWrite && claim.status === "DRAFT" && (
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="email"
+            aria-label="Counterparty email"
+            placeholder="claims@courier.com (optional)"
+            value={contact}
+            onChange={(e) => setContact(e.target.value)}
+            className={`${field} w-56`}
+          />
+          <button
+            disabled={!!busy || !contact}
+            onClick={() =>
+              void act("email", "submit", { send_email: true, counterparty_contact: contact }, (u) =>
+                u.email_sent ? `${u.claim_number} emailed to ${u.counterparty_contact}.` : `${u.claim_number} marked as sent; email failed.`,
+              )
+            }
+            className={`${button} border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10`}
+          >
+            {busy === "email" && <Spinner className="h-3 w-3" />} Email letter
+          </button>
+          <button
+            disabled={!!busy}
+            onClick={() =>
+              void act("send", "submit", contact ? { counterparty_contact: contact } : {}, (u) => `${u.claim_number} marked as sent to ${u.counterparty_name}.`)
+            }
+            className={`${button} border-sky-500/50 text-sky-300 hover:bg-sky-500/10`}
+          >
+            {busy === "send" && <Spinner className="h-3 w-3" />} Mark as sent
+          </button>
+          <button
+            disabled={!!busy}
+            onClick={() => void act("cancel", "cancel", undefined, (u) => `${u.claim_number} cancelled; its findings can be claimed again.`)}
+            className={`${button} border-ink-600 text-slate-300 hover:border-slate-400`}
+          >
+            Cancel draft
+          </button>
+        </div>
+      )}
+
+      {canWrite && collecting && (
+        <form
+          className="flex flex-wrap items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void act("pay", "payments", { amount, reference: reference || null }, (u) =>
+              u.status === "RECOVERED"
+                ? `${u.claim_number} fully recovered.${sentToCheckers(u)}`
+                : `${money(amount, c)} recorded on ${u.claim_number}; ${money(u.outstanding_amount, c)} still outstanding.`,
+            );
+          }}
+        >
+          <input aria-label="Amount received" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} className={`${field} w-28 text-right`} />
+          <input aria-label="Payment reference" placeholder="Bank / UTR reference" value={reference} onChange={(e) => setReference(e.target.value)} className={`${field} w-44`} />
+          <button type="submit" disabled={!!busy || num(amount) <= 0} className={`${button} border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10`}>
+            {busy === "pay" && <Spinner className="h-3 w-3" />} Record payment
+          </button>
+          <button
+            type="button"
+            disabled={!!busy}
+            onClick={() => {
+              const note = window.prompt(`Why did ${claim.counterparty_name} reject ${claim.claim_number}?`, "");
+              if (note && note.trim().length >= 3)
+                void act("reject", "reject", { note: note.trim() }, (u) => `${u.claim_number} marked rejected; its findings are open again.`);
+            }}
+            className={`${button} border-rose-500/40 text-rose-300 hover:bg-rose-500/10`}
+          >
+            Mark rejected
+          </button>
+          <button
+            type="button"
+            disabled={!!busy}
+            onClick={() => {
+              const note = window.prompt(`Reason for writing off ${money(claim.outstanding_amount, c)} on ${claim.claim_number}?`, "");
+              if (note && note.trim().length >= 3)
+                void act("writeoff", "write-off", { note: note.trim() }, (u) => `${u.claim_number} written off.${sentToCheckers(u)}`);
+            }}
+            className={`${button} border-violet-500/40 text-violet-300 hover:bg-violet-500/10`}
+          >
+            Write off balance
+          </button>
+        </form>
+      )}
+
+      <div className="flex flex-wrap gap-2">
+        <button onClick={() => setShowLetter(!showLetter)} className={`${button} border-ink-600 text-slate-300 hover:border-slate-400`}>
+          {showLetter ? "Hide letter" : "View letter"}
+        </button>
+        <button onClick={() => void printLetter()} className={`${button} border-ink-600 text-slate-300 hover:border-slate-400`}>
+          Print / PDF
+        </button>
+      </div>
+      {showLetter && (
+        <div className="rounded-lg border border-ink-700 bg-ink-900 p-3">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="font-medium text-slate-200">{claim.letter_subject}</p>
+            <button
+              onClick={() => {
+                void navigator.clipboard?.writeText(claim.letter_text);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+              className={`${button} border-ink-600 text-slate-300 hover:border-slate-400`}
+            >
+              {copied ? "Copied" : "Copy letter"}
+            </button>
+          </div>
+          <pre className="whitespace-pre-wrap font-sans leading-relaxed text-slate-300" data-testid="claim-letter">
+            {claim.letter_text}
+          </pre>
+        </div>
+      )}
+
+      <ol className="space-y-1 border-l border-ink-700 pl-3" aria-label="Claim timeline">
+        {claim.events.map((e) => (
+          <li key={e.event_id} className="text-slate-400">
+            <span className="text-slate-200">{EVENT_LABEL[e.kind] ?? humanize(e.kind)}</span>
+            {e.amount !== null && e.kind !== "CREATED" ? ` · ${money(e.amount, c)}` : ""}
+            {e.reference ? ` · ref ${e.reference}` : ""} · {e.occurred_on}
+            {e.actor_email && !e.actor_email.startsWith("auditx:") ? ` · ${e.actor_email}` : ""}
+            {e.note ? <span className="block text-[11px] text-slate-500">{e.note}</span> : null}
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
@@ -2351,6 +2951,9 @@ export default function DashboardPage() {
           </div>
           <PanelBoundary title="Courier ledger">
             <CourierLedger metrics={metrics} loading={loading && !metrics} />
+          </PanelBoundary>
+          <PanelBoundary title="Recovery">
+            <RecoveryPanel token={session.token} refreshKey={refreshKey} canWrite={canWrite} onChanged={refresh} />
           </PanelBoundary>
           <PanelBoundary title="Approvals">
             <ApprovalsInbox

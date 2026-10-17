@@ -38,8 +38,10 @@ from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, ApprovalP
                                 DataDictionaryField, DiscrepancyOut, DiscrepancyPage, DiscrepancyStatus,
                                 FieldMappingBulkIn, FieldMappingOut, IngestTarget, IssueType, JobAccepted,
                                 JobOut, JobStatus, JobType, LoginRequest, ManualResolveRequest,
-                                ReconciliationRequest, RegisterRequest, TokenResponse, UserRole)
-from app.services import ai_agent, approvals, mailer
+                                ReconciliationRequest, RegisterRequest, TokenResponse, UserRole,
+                                ClaimableGroup, ClaimCreate, ClaimNote, ClaimOut, ClaimPage, ClaimPayment,
+                                ClaimStatus, ClaimSubmit, RecoverySummary)
+from app.services import ai_agent, approvals, mailer, recovery
 from app.workers.tasks import ingest_file, run_reconciliation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -210,6 +212,11 @@ async def reject_nul_characters(request: Request, call_next: Callable) -> Respon
 
 @app.exception_handler(approvals.ApprovalError)
 async def approval_error_handler(_: Request, exc: approvals.ApprovalError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+
+@app.exception_handler(recovery.RecoveryError)
+async def recovery_error_handler(_: Request, exc: recovery.RecoveryError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
@@ -453,6 +460,13 @@ async def get_job(job_id: UUID, user: CurrentUser = Depends(current_user)) -> Di
 
 
 # ----------------------------------------------------------------------------- discrepancies
+# The open claim (if any) a finding is part of, matched on the natural key that survives reconciliation rebuilds.
+_CLAIM_OF_FINDING = ("SELECT c.claim_number FROM recovery_claim_items i JOIN recovery_claims c ON c.claim_id = i.claim_id "
+                     "JOIN (SELECT discrepancy_logs.org_id, discrepancy_logs.channel, discrepancy_logs.issue_type, "
+                     "discrepancy_logs.source_order_number) d ON TRUE "
+                     f"WHERE i.active AND {recovery.SAME_FAMILY} LIMIT 1")
+
+
 @app.get(f"{P}/discrepancies", response_model=DiscrepancyPage, tags=["discrepancies"])
 async def list_discrepancies(
     status_filter: Optional[DiscrepancyStatus] = Query(None, alias="status"),
@@ -489,7 +503,8 @@ async def list_discrepancies(
         with engine.connect() as conn:
             total = conn.execute(text(f"SELECT COUNT(*) FROM discrepancy_logs WHERE {where}"), params).scalar_one()
             rows = conn.execute(
-                text(f"SELECT * FROM discrepancy_logs WHERE {where} ORDER BY {order} LIMIT :l OFFSET :off"), params
+                text(f"SELECT discrepancy_logs.*, ({_CLAIM_OF_FINDING}) AS claim_number FROM discrepancy_logs "
+                     f"WHERE {where} ORDER BY {order} LIMIT :l OFFSET :off"), params
             ).mappings().all()
         return DiscrepancyPage(total=total, limit=limit, offset=offset, items=[DiscrepancyOut(**r) for r in rows])
 
@@ -619,6 +634,106 @@ async def put_approval_policy(body: ApprovalPolicyIn, user: CurrentUser = Depend
             return approvals.save_policy(conn, user.org_id, body.model_dump(mode="python"), user.email).as_dict()
 
     return await run_in_threadpool(save)
+
+
+# ----------------------------------------------------------------------------- recovery & claims
+def _in_tx(fn: Callable[..., Any], *args: Any) -> Any:
+    with engine.begin() as conn:
+        return fn(conn, *args)
+
+
+def _read(fn: Callable[..., Any], *args: Any) -> Any:
+    with engine.connect() as conn:
+        return fn(conn, *args)
+
+
+@app.get(f"{P}/recovery/summary", response_model=RecoverySummary, tags=["recovery"])
+async def recovery_summary(user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    """Headline numbers: what can be claimed now, what is out with counterparties, and what came back."""
+    return await run_in_threadpool(_read, recovery.summary, user.org_id)
+
+
+@app.get(f"{P}/recovery/claimable", response_model=List[ClaimableGroup], tags=["recovery"])
+async def recovery_claimable(user: CurrentUser = Depends(current_user)) -> List[Dict[str, Any]]:
+    """Open findings a courier, gateway or bank owes, grouped by who owes them."""
+    def run(conn: Any) -> List[Dict[str, Any]]:
+        return recovery.group_by_counterparty(recovery.claimable_findings(conn, user.org_id))
+
+    return await run_in_threadpool(_read, run)
+
+
+@app.get(f"{P}/claims", response_model=ClaimPage, tags=["recovery"])
+async def list_claims(
+    status_filter: Optional[str] = Query(None, alias="status", pattern="^(OPEN|" + "|".join(s.value for s in ClaimStatus) + ")$"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: CurrentUser = Depends(current_user),
+) -> Dict[str, Any]:
+    return await run_in_threadpool(_read, recovery.list_claims, user.org_id, status_filter, limit, offset)
+
+
+@app.post(f"{P}/claims", response_model=ClaimOut, status_code=201, tags=["recovery"])
+async def create_claim(body: ClaimCreate, user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
+    """Draft a claim from findings owed by one counterparty. The letter is generated from the evidence."""
+    return await run_in_threadpool(
+        _in_tx, recovery.create_claim, user.org_id, user.user_id, user.email, body.log_ids,
+        body.counterparty_contact, body.notes, body.due_days,
+    )
+
+
+@app.get(f"{P}/claims/{{claim_id}}", response_model=ClaimOut, tags=["recovery"])
+async def get_claim(claim_id: UUID, user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    return await run_in_threadpool(_read, recovery.get_claim, user.org_id, claim_id)
+
+
+@app.get(f"{P}/claims/{{claim_id}}/letter", tags=["recovery"])
+async def claim_letter(claim_id: UUID, user: CurrentUser = Depends(current_user)) -> Dict[str, str]:
+    """The claim letter as subject, plain text and print-ready HTML."""
+    def run(conn: Any) -> Dict[str, str]:
+        claim = recovery.get_claim(conn, user.org_id, claim_id)
+        company = conn.execute(text("SELECT company_name FROM organizations WHERE org_id = :o"),
+                               {"o": str(user.org_id)}).scalar_one()
+        subject, body, body_html = recovery.render_letter(claim, claim["items"], company)
+        return {"subject": subject, "text": body, "html": body_html}
+
+    return await run_in_threadpool(_read, run)
+
+
+@app.post(f"{P}/claims/{{claim_id}}/submit", response_model=ClaimOut, tags=["recovery"])
+async def submit_claim(claim_id: UUID, body: ClaimSubmit = ClaimSubmit(),
+                       user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
+    """Mark the claim as sent; with send_email the letter is emailed to the counterparty contact."""
+    claim, sent, error = await run_in_threadpool(
+        _in_tx, recovery.submit_claim, user.org_id, claim_id, user.email, body.send_email, body.counterparty_contact)
+    return {**claim, "email_sent": sent if body.send_email else None, "email_error": error}
+
+
+@app.post(f"{P}/claims/{{claim_id}}/payments", response_model=ClaimOut, tags=["recovery"])
+async def record_claim_payment(claim_id: UUID, body: ClaimPayment,
+                               user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
+    """Book money received against the claim. When it is fully recovered, its open findings go to maker-checker."""
+    return await run_in_threadpool(
+        _in_tx, recovery.record_payment, user.org_id, claim_id, user.user_id, user.email, body.amount,
+        body.reference, body.received_on, body.note,
+    )
+
+
+@app.post(f"{P}/claims/{{claim_id}}/reject", response_model=ClaimOut, tags=["recovery"])
+async def reject_claim(claim_id: UUID, body: ClaimNote, user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
+    """The counterparty refused; its findings become claimable again."""
+    return await run_in_threadpool(_in_tx, recovery.reject_claim, user.org_id, claim_id, user.email, body.note)
+
+
+@app.post(f"{P}/claims/{{claim_id}}/write-off", response_model=ClaimOut, tags=["recovery"])
+async def write_off_claim(claim_id: UUID, body: ClaimNote, user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
+    """Stop chasing the balance. Open findings are written off through the approval policy."""
+    return await run_in_threadpool(
+        _in_tx, recovery.write_off, user.org_id, claim_id, user.user_id, user.email, body.note)
+
+
+@app.post(f"{P}/claims/{{claim_id}}/cancel", response_model=ClaimOut, tags=["recovery"])
+async def cancel_claim(claim_id: UUID, user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
+    return await run_in_threadpool(_in_tx, recovery.cancel_claim, user.org_id, claim_id, user.email)
 
 
 # ----------------------------------------------------------------------------- team members

@@ -258,6 +258,69 @@ ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS audit_jobs_job_type_check;
 ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS ck_audit_job_type;
 ALTER TABLE audit_jobs ADD CONSTRAINT ck_audit_job_type CHECK (job_type IN
     ('INGEST_ORDERS', 'INGEST_GATEWAY', 'INGEST_BANK', 'INGEST_COURIER', 'RECONCILIATION'));
+
+-- Recovery: money a courier, gateway or bank owes is claimed back. Items snapshot the finding by its natural
+-- key (channel, issue_type, reference) because reconciliation rebuilds open findings with new log_ids.
+CREATE TABLE IF NOT EXISTS recovery_claims (
+    claim_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id                UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    claim_seq             INT NOT NULL,
+    claim_number          VARCHAR(24) NOT NULL,
+    counterparty_type     VARCHAR(12) NOT NULL CHECK (counterparty_type IN ('COURIER', 'GATEWAY', 'BANK')),
+    counterparty_name     VARCHAR(128) NOT NULL,
+    counterparty_contact  VARCHAR(320),
+    currency              VARCHAR(3) NOT NULL,
+    status                VARCHAR(24) NOT NULL DEFAULT 'DRAFT' CHECK (status IN
+                          ('DRAFT', 'SUBMITTED', 'PARTIALLY_RECOVERED', 'RECOVERED', 'REJECTED', 'WRITTEN_OFF', 'CANCELLED')),
+    claimed_amount        NUMERIC(18, 2) NOT NULL CHECK (claimed_amount > 0),
+    recovered_amount      NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (recovered_amount >= 0),
+    written_off_amount    NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (written_off_amount >= 0),
+    due_date              DATE,
+    notes                 TEXT,
+    created_by            UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    created_by_email      VARCHAR(320),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    submitted_at          TIMESTAMPTZ,
+    closed_at             TIMESTAMPTZ,
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_claim_seq_per_org UNIQUE (org_id, claim_seq),
+    CONSTRAINT ck_claim_not_over_recovered CHECK (recovered_amount + written_off_amount <= claimed_amount)
+);
+CREATE INDEX IF NOT EXISTS ix_claims_org_status ON recovery_claims (org_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS recovery_claim_items (
+    item_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    claim_id             UUID NOT NULL REFERENCES recovery_claims(claim_id) ON DELETE CASCADE,
+    org_id               UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    source_order_number  VARCHAR(128) NOT NULL,
+    issue_type           VARCHAR(32) NOT NULL,
+    channel              VARCHAR(16) NOT NULL,
+    amount               NUMERIC(18, 2) NOT NULL CHECK (amount > 0),
+    root_cause_category  VARCHAR(64),
+    evidence             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    data_cleared_amount  NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (data_cleared_amount >= 0),
+    active               BOOLEAN NOT NULL DEFAULT TRUE
+);
+-- A finding can sit in only one open claim at a time.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_claim_item
+    ON recovery_claim_items (org_id, channel, issue_type, source_order_number) WHERE active;
+CREATE INDEX IF NOT EXISTS ix_claim_items_claim ON recovery_claim_items (claim_id);
+
+CREATE TABLE IF NOT EXISTS recovery_events (
+    event_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    claim_id      UUID NOT NULL REFERENCES recovery_claims(claim_id) ON DELETE CASCADE,
+    org_id        UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    kind          VARCHAR(16) NOT NULL CHECK (kind IN
+                  ('CREATED', 'SUBMITTED', 'EMAILED', 'PAYMENT', 'DATA_MATCH', 'REJECTED', 'WRITTEN_OFF', 'CANCELLED')),
+    amount        NUMERIC(18, 2),
+    reference     VARCHAR(128),
+    note          TEXT,
+    actor_email   VARCHAR(320),
+    occurred_on   DATE NOT NULL DEFAULT CURRENT_DATE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_recovery_events_claim ON recovery_events (claim_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_recovery_events_org ON recovery_events (org_id, kind, occurred_on);
 """
 
 # Core canonical schema every client ERP / gateway export is mapped onto.
