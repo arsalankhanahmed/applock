@@ -1,6 +1,6 @@
 # AuditX — Enterprise B2B Pitch Deck Framework
 
-A 14-slide template with a speaker script for each slide. It is written for CFOs, Financial Controllers, Heads of
+A 16-slide template with a speaker script for each slide. It is written for CFOs, Financial Controllers, Heads of
 Revenue Assurance, Internal Audit Directors and Big 4 / premium audit-firm partners.
 
 **How to use it:** keep slide text to the headline plus 3 bullets. The script is what you *say*. Square-bracketed
@@ -86,8 +86,9 @@ and either healed or routed to a human with a proposed fix."
 
 ## Slide 6 — How It Works (Architecture)
 
-**On slide:** diagram: `ERP / Storefront CSV` + `Gateway settlement CSV` → **Universal Parser** → PostgreSQL
-(tenant-scoped) → **Reconciliation Engine** → `discrepancy_logs` → **Auto-Healer** → Dashboard + Forensic Agent
+**On slide:** diagram: `ERP / Storefront CSV` + `Gateway settlement CSV` + `Courier COD report` + `Bank statement`
+→ **Universal Parser** → PostgreSQL
+(tenant-scoped) → **Reconciliation Engine** (gateway, bank and COD legs) → `discrepancy_logs` → **Auto-Healer** → Dashboard + Forensic Agent
 
 - FastAPI async gateway; heavy jobs on Celery workers (202 Accepted, never blocks)
 - Streamed, chunked parsing: memory stays flat for 500 MB+ exports
@@ -118,7 +119,7 @@ cleaned automatically."
 
 ---
 
-## Slide 8 — The Three Leakage Vectors
+## Slide 8 — Leg 1: Orders ↔ Gateway
 
 **On slide:**
 | Vector | Meaning | Business risk |
@@ -136,7 +137,52 @@ a known 5% anomaly mix plus FX noise into 20,000 orders. AuditX found every sing
 
 ---
 
-## Slide 9 — AI Auto-Healer
+## Slide 9 — Leg 2: Settlements ↔ Bank
+
+**On slide:** *Paid out is not the same as banked.*
+- Gateway payouts (daily) and courier remittances (weekly CPR batches) → bank statement credits
+- Matched by reference, then by exact amount within 10 days
+- **Not deposited** (still missing after 7 days) → payment-trace request drafted
+- **Deposit mismatch** → bank charges auto-heal with a journal entry; larger gaps go to a person
+- **Unidentified credit** → allocate it or park it in suspense
+
+*Demo benchmark:* 139 settlement batches, 134 matched (110 by reference, 24 by amount), 6 of 6 planted breaks found.
+
+**Script:**
+"The gateway telling you it paid out is not the same as the money sitting in your bank. Every payout and every
+courier remittance is expected to land as one bank credit. AuditX matches them by the reference in the
+narration, and by amount when the bank truncates it. You get three lists: money that never arrived, money that
+arrived short, and money nobody can explain. Loans and interest are ignored, so the list stays clean."
+
+---
+
+## Slide 10 — Leg 3: COD ↔ Couriers
+
+**On slide:** *Find the cash couriers still hold.*
+| Break | What it means |
+|-------|---------------|
+| Not remitted | Delivered, cash collected, unpaid after 10 days |
+| Short remittance | Rider short-collected, or the courier deducted |
+| Overcharges | Charge far above that courier's usual rate |
+| Return still booked | Parcel came back, the ERP still shows a sale |
+| Lost or stuck | Reported lost, or in transit for 21+ days |
+| Never dispatched | COD order no courier ever received |
+| Parcel not in ERP | Cash collected for a sale never booked |
+
+*Demo benchmark:* 6,449 COD orders, 298 of 298 planted COD breaks found. TCS, Leopards, PostEx and Trax
+reports are mapped once; every finding carries the claim amount and next steps, and a person approves each one.
+
+**Script:**
+"For brands that sell cash on delivery, the biggest leak isn't the gateway, it's the courier. AuditX reads each
+courier's parcel report and checks every COD order: dispatched, delivered, cash returned, right amount.
+The courier ledger on the dashboard shows how much cash each courier is holding right now and how much of it is
+overdue. Nothing here is auto-resolved: every finding is money to recover, so your team approves the claim."
+
+**Discovery hook:** "What share of your orders is COD, and which couriers do you use?"
+
+---
+
+## Slide 11 — AI Auto-Healer
 
 **On slide:** *It doesn't just flag. It explains, proposes the journal entry and closes the loop.*
 | Pattern | Category | Confidence | Action |
@@ -148,7 +194,8 @@ a known 5% anomaly mix plus FX noise into 20,000 orders. AuditX found every sing
 | Charged twice | `DUPLICATE_CAPTURE` | 88% | Refund (human approval) |
 | Variance ≥ 20% of order | `POTENTIAL_FRAUD_OR_MANIPULATION` | escalated | Forensic review |
 
-*Demo benchmark:* **46% of all breaks auto-healed**, each with gateway API evidence and a balanced journal entry.
+*Demo benchmark:* **46% of gateway breaks auto-healed**, each with gateway API evidence and a balanced journal entry.
+Bank charges deducted from deposits heal the same way. Courier claims always go to a person.
 
 **Script:**
 "Low-risk, high-confidence patterns are resolved autonomously, and every resolution carries the evidence trail,
@@ -157,7 +204,7 @@ suspected manipulation, is never auto-resolved. It goes to a human with the work
 
 ---
 
-## Slide 10 — Chat-with-your-Ledger
+## Slide 12 — Chat-with-your-Ledger
 
 **On slide:** *"Which orders over $500 have no payment?" → answer in seconds, with the SQL shown.*
 - Natural language → one read-only PostgreSQL query
@@ -172,21 +219,21 @@ hides it."
 
 ---
 
-## Slide 11 — Live Demo (10 minutes)
+## Slide 13 — Live Demo (10 minutes)
 
 **Run-sheet:**
-1. Dashboard: open leakage, auto-healed value, match rate (30 s)
-2. Leak-state bars → click **Missing Payments** in the tracking matrix (1 min)
+1. Dashboard: open leakage, not banked, COD with couriers (30 s)
+2. **Courier COD ledger**: which courier holds the most cash, and how much is overdue (1 min)
 3. Expand a **PROMO_CODE_UNSYNCED** row: show the transform, journal entry and gateway evidence (2 min)
-4. Upload the prospect-style dirty SAP CSV → show the 202 job → re-run reconciliation (3 min)
-5. Chat: *"Show suspicious fraud risk items"* → **view SQL** (2 min)
+4. Upload the prospect-style dirty SAP CSV or courier report → show the 202 job → re-run reconciliation (3 min)
+5. Chat: *"Which payouts never reached the bank?"* → **view SQL** (2 min)
 6. Resolve a finding manually with an audit note (1 min)
 
 **Script cue:** "Let me stop describing it and show you, on data shaped like yours."
 
 ---
 
-## Slide 12 — Built for Auditors (Big 4 / Premium Firms)
+## Slide 14 — Built for Auditors (Big 4 / Premium Firms)
 
 **On slide:** *A force multiplier for every engagement team.*
 - Multi-tenant: one workspace per client engagement, hard isolation
@@ -201,7 +248,7 @@ the working papers comes with its evidence attached."
 
 ---
 
-## Slide 13 — Commercial Model & Pilot
+## Slide 15 — Commercial Model & Pilot
 
 **On slide:**
 | Tier | For | Basis |
@@ -219,7 +266,7 @@ agree today what success looks like; and in 30 days you'll see your actual leaka
 
 ---
 
-## Slide 14 — The Ask & Next Steps
+## Slide 16 — The Ask & Next Steps
 
 **On slide:**
 1. Nominate a finance owner and an IT contact
