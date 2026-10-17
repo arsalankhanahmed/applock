@@ -166,7 +166,8 @@ _DANGEROUS_FUNCS_RE = re.compile(
     re.IGNORECASE,
 )
 _SENSITIVE_RE = re.compile(
-    r"\b(users|password_hash|email|client_field_mappings|audit_jobs|invitations|token_hash|approval_policies)\b",
+    r"\b(users|password_hash|email|client_field_mappings|audit_jobs|invitations|token_hash|approval_policies|"
+    r"alert_settings|alert_recipients|alert_deliveries)\b",
     re.IGNORECASE,
 )
 _TENANT_PREDICATE_RE = re.compile(r"(?:\b[a-z_][a-z0-9_]*\.)?\borg_id\s*=\s*:org_id\b", re.IGNORECASE)
@@ -199,6 +200,9 @@ TENANT_VIEWS = {
         "FROM public.recovery_events WHERE org_id = '{org}'"
     ),
     "approval_policies": "SELECT NULL::uuid AS org_id WHERE FALSE",
+    "alert_settings": "SELECT NULL::uuid AS org_id WHERE FALSE",
+    "alert_recipients": "SELECT NULL::uuid AS recipient_id, NULL::uuid AS org_id WHERE FALSE",
+    "alert_deliveries": "SELECT NULL::uuid AS delivery_id, NULL::uuid AS org_id WHERE FALSE",
     "invitations": "SELECT NULL::uuid AS invite_id, NULL::uuid AS org_id WHERE FALSE",
     "users": "SELECT NULL::uuid AS user_id, NULL::uuid AS org_id WHERE FALSE",
     "client_field_mappings": "SELECT NULL::uuid AS mapping_id, NULL::uuid AS org_id WHERE FALSE",

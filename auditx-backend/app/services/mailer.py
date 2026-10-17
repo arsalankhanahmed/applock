@@ -1,4 +1,4 @@
-"""Outgoing email (team invitations and recovery claim letters) over plain SMTP.
+"""Outgoing email (team invitations, recovery claim letters and alert digests) over plain SMTP.
 
 Works with any SMTP provider: Gmail / Google Workspace (app password), Microsoft 365, Brevo, Mailgun,
 Amazon SES, Resend's SMTP relay, or a local catcher such as Mailpit in development. When SMTP_HOST is empty
@@ -115,3 +115,15 @@ def send_claim(to: str, subject: str, text: str, body_html: str, reply_to: Optio
     message.set_content(text)
     message.add_alternative(body_html, subtype="html")
     return _send(message, fallback="copy or print the claim letter instead")
+
+
+def send_alert(to: str, subject: str, text: str, body_html: str) -> Tuple[bool, Optional[str]]:
+    """Send an alert digest by email. Returns (sent, error)."""
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = settings.SMTP_FROM
+    message["To"] = to
+    message["Message-ID"] = make_msgid(domain="auditx")
+    message.set_content(text)
+    message.add_alternative(body_html, subtype="html")
+    return _send(message, fallback="email alerts are skipped until SMTP is set up")

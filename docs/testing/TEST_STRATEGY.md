@@ -20,6 +20,7 @@ AuditX moves money decisions, so testing effort follows business risk:
 | **Agent writes or escapes its sandbox** | An LLM generating `DELETE` or reading `users` | Guard unit tests, read-only sandbox, statement timeout, prompt-injection tests |
 | **Ingestion of messy files** | Real ERP/bank/courier exports are dirty | Parser unit tests (formats), integration (BOM, `;`, chunks), ad-hoc (UTF-16, binary, huge values) |
 | **Recovery counted wrongly** | Money "recovered" that never came back, or counted twice, misstates the books | Integration (part payment in data, data match plus recorded payment), API (overpayment refused), UI UC-15/16 |
+| **Unwanted or leaked alert messages** | Messaging people without consent, or repeating messages, harms the client's reputation; phone numbers are personal data | Integration (consent, once per period, retry cap), API (roles, tenant isolation, masked logs), unit (agent cannot read alert tables) |
 | **Account takeover** | Weak sessions, never-expiring tokens | Tampered/expired/no-`exp` JWT, password change revokes sessions, invite token single-use |
 
 ## 2. Test levels and techniques

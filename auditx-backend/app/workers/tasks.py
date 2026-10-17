@@ -43,6 +43,8 @@ celery_app.conf.update(
         "auditx.run_reconciliation": {"queue": "reconcile"},
     },
     task_default_queue="default",
+    # Alert digests: the job is cheap when nothing is due, and each recipient gets at most one per period.
+    beat_schedule={"send-due-alerts": {"task": "auditx.send_due_alerts", "schedule": 15 * 60}},
 )
 
 
@@ -111,3 +113,11 @@ def run_reconciliation(self, job_id: str, org_id: str, auto_heal: bool = True) -
         logger.exception("Reconciliation job %s failed", job_id)
         _mark_job(job_id, "FAILED", error=f"{type(exc).__name__}: {exc}")
         raise
+
+
+@celery_app.task(name="auditx.send_due_alerts")
+def send_due_alerts() -> Dict[str, int]:
+    """Periodic (Celery beat): send WhatsApp / email digests that are due."""
+    from app.services.alerts import run_due
+
+    return run_due()

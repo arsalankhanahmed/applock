@@ -228,6 +228,25 @@ account this month, and it is usually many times the subscription fee."
 
 ---
 
+## Slide 11B — WhatsApp Alerts (optional add-on)
+
+**On slide:** *The owner doesn't open the dashboard; AuditX comes to them.*
+
+> *AuditX alert · Karachi Traders:* TCS holds PKR 230,000 COD for 41 orders, oldest delivered 18 days ago |
+> 2 payouts worth PKR 85,000 not fully in the bank | 3 fixes waiting for a checker | Recovered this month: PKR 480,000 *(example)*
+
+* Daily or every Monday, at the client's chosen hour and time zone, on WhatsApp or email.
+* Off by default and switched on per client, so it can be sold as an add-on.
+* Opt-in consent recorded for every number; delivery log with masked numbers.
+* Works with the WhatsApp Business Cloud API or Twilio.
+
+**Script:**
+"Most business owners live on WhatsApp, not in dashboards. Every morning at nine they get one message saying
+which courier is sitting on their cash and what is waiting for approval, and they tap the link if they want
+details. That message is what makes AuditX a daily habit."
+
+---
+
 ## Slide 12 — Chat-with-your-Ledger
 
 **On slide:** *"Which orders over $500 have no payment?" → answer in seconds, with the SQL shown.*

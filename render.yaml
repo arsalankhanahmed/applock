@@ -34,6 +34,16 @@ services:
         sync: false
       - key: SMTP_PORT
         value: "587"
+      - key: WHATSAPP_PROVIDER
+        sync: false
+      - key: WHATSAPP_META_TOKEN
+        sync: false
+      - key: WHATSAPP_META_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_TEMPLATE_NAME
+        value: auditx_daily_alert
+      - key: ALERTS_CRON_TOKEN
+        generateValue: true
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
