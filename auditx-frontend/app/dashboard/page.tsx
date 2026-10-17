@@ -202,6 +202,20 @@ interface ApprovalPolicy {
   updated_by_email: string | null;
 }
 
+type Role = "OWNER" | "ADMIN" | "ANALYST" | "AUDITOR" | "VIEWER";
+
+interface Member {
+  user_id: string;
+  full_name: string;
+  email: string;
+  role: Role;
+  created_at: string;
+}
+
+interface MeResponse {
+  user: { user_id: string; org_id: string; role: Role; email: string };
+}
+
 interface BulkResult {
   approved: string[];
   failed: Record<string, string>;
@@ -1521,6 +1535,263 @@ function ApprovalsInbox({
   );
 }
 
+/* ============================================================================
+ * Team members
+ * ========================================================================== */
+const ROLE_GUIDE: Record<Role, string> = {
+  OWNER: "Everything, including owners, policy and the team",
+  ADMIN: "Manages the team (not owners) and policy; can approve",
+  ANALYST: "Uploads files, runs reconciliation, proposes fixes (maker)",
+  AUDITOR: "Approves or rejects fixes (checker); can also propose",
+  VIEWER: "Read-only access to the dashboard and chat",
+};
+const ROLES = Object.keys(ROLE_GUIDE) as Role[];
+
+function generatePassword(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = new Uint32Array(12);
+  window.crypto.getRandomValues(bytes);
+  const body = Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+  return `${body}#${(bytes[0] % 90) + 10}`;
+}
+
+function TeamPanel({ token, myRole, myUserId }: { token: string; myRole: Role; myUserId: string | null }) {
+  const [members, setMembers] = useState<Member[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [shared, setShared] = useState<{ name: string; email: string; password: string } | null>(null);
+  const [form, setForm] = useState<{ full_name: string; email: string; role: Role; password: string }>({
+    full_name: "",
+    email: "",
+    role: "AUDITOR",
+    password: "",
+  });
+  const [showForm, setShowForm] = useState(false);
+  const canManage = myRole === "OWNER" || myRole === "ADMIN";
+  const assignable = ROLES.filter((r) => r !== "OWNER" || myRole === "OWNER");
+
+  const load = useCallback(() => {
+    api<Member[]>("/api/v1/users", token)
+      .then((m) => {
+        setMembers(m);
+        setError(null);
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : "Failed to load the team"));
+  }, [token]);
+
+  useEffect(load, [load]);
+
+  async function addMember(e: FormEvent) {
+    e.preventDefault();
+    setBusy("add");
+    setError(null);
+    try {
+      const created = await api<Member>("/api/v1/users", token, { method: "POST", body: JSON.stringify(form) });
+      setShared({ name: created.full_name, email: created.email, password: form.password });
+      setForm({ full_name: "", email: "", role: form.role, password: "" });
+      setShowForm(false);
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not add the member");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function changeRole(m: Member, role: Role) {
+    setBusy(m.user_id);
+    setError(null);
+    try {
+      await api<Member>(`/api/v1/users/${m.user_id}`, token, { method: "PATCH", body: JSON.stringify({ role }) });
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not change the role");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function resetPassword(m: Member) {
+    if (!window.confirm(`Set a new password for ${m.full_name}? Their current password stops working.`)) return;
+    const password = generatePassword();
+    setBusy(m.user_id);
+    setError(null);
+    try {
+      await api<Member>(`/api/v1/users/${m.user_id}`, token, { method: "PATCH", body: JSON.stringify({ password }) });
+      setShared({ name: m.full_name, email: m.email, password });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reset the password");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove(m: Member) {
+    if (!window.confirm(`Remove ${m.full_name} (${m.email})? They lose access immediately; their approval history stays.`)) return;
+    setBusy(m.user_id);
+    setError(null);
+    try {
+      await fetch(`${API_BASE}/api/v1/users/${m.user_id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }).then(async (r) => {
+        if (!r.ok) {
+          const body: unknown = await r.json().catch(() => null);
+          throw new Error(body && typeof body === "object" && "detail" in body ? String((body as { detail: unknown }).detail) : r.statusText);
+        }
+      });
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not remove the member");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function copyShared() {
+    if (!shared) return;
+    try {
+      await navigator.clipboard.writeText(`AuditX sign-in\nEmail: ${shared.email}\nPassword: ${shared.password}`);
+    } catch {
+      /* clipboard blocked: the details stay on screen to copy by hand */
+    }
+  }
+
+  const input = "rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-emerald-500";
+  const smallButton = "rounded-md border border-ink-600 px-2 py-0.5 text-[11px] text-slate-300 hover:border-slate-400 disabled:opacity-50";
+
+  return (
+    <Card
+      title="Team"
+      action={
+        canManage ? (
+          <button onClick={() => setShowForm(!showForm)} className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-ink-950 hover:bg-emerald-400">
+            {showForm ? "Cancel" : "Add member"}
+          </button>
+        ) : undefined
+      }
+    >
+      {error && <p className="mb-3 rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
+      {shared && (
+        <div className="mb-4 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs text-emerald-100">
+          <p className="font-semibold">Share these sign-in details with {shared.name} privately. This password is shown only once.</p>
+          <p className="mt-1.5 font-mono">
+            {shared.email} · {shared.password}
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => void copyShared()} className="rounded-md border border-emerald-400/50 px-2 py-0.5 hover:bg-emerald-500/10">
+              Copy
+            </button>
+            <button onClick={() => setShared(null)} className="rounded-md border border-emerald-400/50 px-2 py-0.5 hover:bg-emerald-500/10">
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+      {showForm && canManage && (
+        <form onSubmit={addMember} className="mb-4 grid gap-3 rounded-xl border border-ink-700 bg-ink-850/60 p-4 text-xs md:grid-cols-2">
+          <label className="flex flex-col gap-1">
+            <span className="text-slate-400">Full name</span>
+            <input required minLength={2} value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} className={input} />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-slate-400">Work email</span>
+            <input required type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className={input} />
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-slate-400">Role</span>
+            <select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as Role })} className={input}>
+              {assignable.map((r) => (
+                <option key={r} value={r}>
+                  {humanize(r)}
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-slate-500">{ROLE_GUIDE[form.role]}</span>
+          </label>
+          <label className="flex flex-col gap-1">
+            <span className="text-slate-400">Temporary password (10+ characters)</span>
+            <div className="flex gap-2">
+              <input required minLength={10} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className={`${input} flex-1 font-mono`} />
+              <button type="button" onClick={() => setForm({ ...form, password: generatePassword() })} className="rounded-lg border border-ink-600 px-2.5 text-slate-300 hover:border-slate-400">
+                Generate
+              </button>
+            </div>
+          </label>
+          <div className="md:col-span-2 flex justify-end">
+            <button type="submit" disabled={busy === "add"} className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1.5 font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-60">
+              {busy === "add" && <Spinner className="h-3 w-3" />} Add to team
+            </button>
+          </div>
+        </form>
+      )}
+      {!members ? (
+        <Skeleton className="h-24" />
+      ) : (
+        <div className="-mx-5 overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                <th className="px-5 pb-2 font-medium">Member</th>
+                <th className="pb-2 font-medium">Role</th>
+                <th className="pb-2 font-medium">Added</th>
+                <th className="px-5 pb-2 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ink-700">
+              {members.map((m) => {
+                const isMe = m.user_id === myUserId;
+                const editable = canManage && !isMe && (m.role !== "OWNER" || myRole === "OWNER");
+                return (
+                  <tr key={m.user_id} className={busy === m.user_id ? "opacity-60" : ""}>
+                    <td className="px-5 py-2.5">
+                      <p className="text-slate-200">
+                        {m.full_name} {isMe && <Badge className={TONE.sky}>You</Badge>}
+                      </p>
+                      <p className="text-xs text-slate-500">{m.email}</p>
+                    </td>
+                    <td className="py-2.5">
+                      {editable ? (
+                        <select
+                          aria-label={`Role for ${m.full_name}`}
+                          value={m.role}
+                          disabled={busy === m.user_id}
+                          onChange={(e) => void changeRole(m, e.target.value as Role)}
+                          className={input}
+                        >
+                          {assignable.map((r) => (
+                            <option key={r} value={r}>
+                              {humanize(r)}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="text-xs text-slate-300">{humanize(m.role)}</span>
+                      )}
+                      <p className="mt-0.5 text-[11px] text-slate-500">{ROLE_GUIDE[m.role]}</p>
+                    </td>
+                    <td className="py-2.5 text-xs text-slate-500">{timeAgo(m.created_at)}</td>
+                    <td className="px-5 py-2.5 text-right">
+                      {editable && (
+                        <div className="flex justify-end gap-1.5">
+                          <button onClick={() => void resetPassword(m)} disabled={busy === m.user_id} className={smallButton}>
+                            Reset password
+                          </button>
+                          <button onClick={() => void remove(m)} disabled={busy === m.user_id} className={`${smallButton} border-rose-500/40 text-rose-300 hover:bg-rose-500/10`}>
+                            Remove
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {!canManage && <p className="mt-3 text-xs text-slate-500">Only owners and admins can add or change team members.</p>}
+    </Card>
+  );
+}
+
 const SUGGESTIONS = [
   "What is our total open revenue leakage by issue type?",
   "Which findings did the auto-healer resolve and how much value?",
@@ -1817,6 +2088,24 @@ export default function DashboardPage() {
   }, [session, refreshKey, logout]);
 
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const [myUserId, setMyUserId] = useState<string | null>(null);
+
+  // The server decides roles; pick up a role change (or removal) made since this browser signed in.
+  useEffect(() => {
+    if (!session) return;
+    api<MeResponse>("/api/v1/me", session.token)
+      .then((me) => {
+        setMyUserId(me.user.user_id);
+        if (me.user.role !== session.role) {
+          const next = { ...session, role: me.user.role };
+          saveSession(next);
+          setSession(next);
+        }
+      })
+      .catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 401) logout();
+      });
+  }, [session, logout]);
   const canWrite = useMemo(() => !!session && ["OWNER", "ADMIN", "ANALYST"].includes(session.role), [session]);
   const canResolve = useMemo(() => canWrite || session?.role === "AUDITOR", [canWrite, session]);
   const canApprove = useMemo(() => !!session && ["OWNER", "ADMIN", "AUDITOR"].includes(session.role), [session]);
@@ -1846,6 +2135,9 @@ export default function DashboardPage() {
             <p className="text-sm font-medium text-slate-200">{metrics?.company_name ?? session.companyName}</p>
             <p className="text-[11px] text-slate-500">
               Last reconciliation {timeAgo(metrics?.last_reconciliation_at ?? null)} · {session.role}
+              <a href="#team" className="ml-3 text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline">
+                Team
+              </a>
               <button onClick={logout} className="ml-3 text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline">
                 Sign out
               </button>
@@ -1893,6 +2185,10 @@ export default function DashboardPage() {
           </PanelBoundary>
           <PanelBoundary title="Tracking matrix">
             <TrackingMatrix token={session.token} currency={currency} refreshKey={refreshKey} canResolve={canResolve} onChanged={refresh} />
+          </PanelBoundary>
+          <PanelBoundary title="Team">
+            <div id="team" className="scroll-mt-6" />
+            <TeamPanel token={session.token} myRole={session.role as Role} myUserId={myUserId} />
           </PanelBoundary>
         </div>
         <div className="xl:sticky xl:top-6 xl:self-start">

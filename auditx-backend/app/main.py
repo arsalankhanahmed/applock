@@ -23,7 +23,7 @@ from fastapi import (BackgroundTasks, Depends, FastAPI, File, HTTPException, Que
                      status)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -33,7 +33,7 @@ from app.database import engine, init_db
 from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, ApprovalPage, ApprovalPolicyIn,
                                 ApprovalPolicyOut, ApprovalRequestOut, BulkDecisionRequest, BulkDecisionResult,
                                 Channel, CurrentUser, DashboardMetrics, DecisionRequest, RequestStatus, UserCreate,
-                                UserOut,
+                                UserOut, UserUpdate,
                                 DataDictionaryField, DiscrepancyOut, DiscrepancyPage, DiscrepancyStatus,
                                 FieldMappingBulkIn, FieldMappingOut, IngestTarget, IssueType, JobAccepted,
                                 JobOut, JobStatus, JobType, LoginRequest, ManualResolveRequest,
@@ -93,10 +93,20 @@ async def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(b
     try:
         claims = jwt.decode(creds.credentials, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM],
                             issuer="auditx")
-        return CurrentUser(user_id=claims["sub"], org_id=claims["org"], role=claims["role"], email=claims["email"])
+        user_id, org_id = UUID(claims["sub"]), UUID(claims["org"])
     except (jwt.PyJWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Invalid token: {exc}",
                             headers={"WWW-Authenticate": "Bearer"}) from exc
+    # The token proves identity; the role always comes from the database, so a removed or demoted
+    # member loses access immediately instead of when the token expires.
+    row = await run_in_threadpool(
+        _fetch_one, "SELECT role, email FROM users WHERE user_id = :u AND org_id = :o",
+        {"u": str(user_id), "o": str(org_id)},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "This account no longer has access",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return CurrentUser(user_id=user_id, org_id=org_id, role=row["role"], email=row["email"])
 
 
 def require_roles(*roles: UserRole) -> Callable[..., Any]:
@@ -585,6 +595,70 @@ async def create_user(body: UserCreate, user: CurrentUser = Depends(require_role
     except IntegrityError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email already exists") from exc
     return row
+
+
+def _lock_member(conn: Any, actor: CurrentUser, target_id: UUID) -> tuple[Dict[str, Any], int]:
+    """Lock the org's members and return (target, owner_count); enforce who may manage whom."""
+    members = conn.execute(
+        text("SELECT user_id, role FROM users WHERE org_id = :o ORDER BY user_id FOR UPDATE"), {"o": str(actor.org_id)}
+    ).mappings().all()
+    target = next((dict(m) for m in members if str(m["user_id"]) == str(target_id)), None)
+    if target is None:
+        raise HTTPException(404, "Team member not found")
+    if target["role"] == UserRole.OWNER.value and actor.role != UserRole.OWNER:
+        raise HTTPException(403, "Only an owner can change or remove an owner")
+    owners = sum(1 for m in members if m["role"] == UserRole.OWNER.value)
+    return target, owners
+
+
+@app.patch(f"{P}/users/{{user_id}}", response_model=UserOut, tags=["auth"])
+async def update_user(user_id: UUID, body: UserUpdate, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    """Change a member's role or name, or set a new password (e.g. a reset)."""
+    def run() -> Dict[str, Any]:
+        with engine.begin() as conn:
+            target, owners = _lock_member(conn, user, user_id)
+            if body.role is not None and body.role.value != target["role"]:
+                if str(user_id) == str(user.user_id):
+                    raise HTTPException(403, "You cannot change your own role")
+                if body.role == UserRole.OWNER and user.role != UserRole.OWNER:
+                    raise HTTPException(403, "Only an owner can make someone an owner")
+                if target["role"] == UserRole.OWNER.value and owners <= 1:
+                    raise HTTPException(409, "The company must keep at least one owner")
+            row = conn.execute(
+                text(
+                    """
+                    UPDATE users
+                       SET full_name = COALESCE(:n, full_name),
+                           role = COALESCE(:r, role),
+                           password_hash = COALESCE(:p, password_hash)
+                     WHERE user_id = :u AND org_id = :o
+                    RETURNING user_id, full_name, email, role, created_at
+                    """
+                ),
+                {"n": body.full_name, "r": body.role.value if body.role else None,
+                 "p": hash_password(body.password) if body.password else None,
+                 "u": str(user_id), "o": str(user.org_id)},
+            ).mappings().one()
+            return dict(row)
+
+    return await run_in_threadpool(run)
+
+
+@app.delete(f"{P}/users/{{user_id}}", status_code=204, response_class=Response, tags=["auth"])
+async def remove_user(user_id: UUID, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Response:
+    """Remove a member. Their approval history stays (emails are kept on each request)."""
+    def run() -> None:
+        with engine.begin() as conn:
+            if str(user_id) == str(user.user_id):
+                raise HTTPException(403, "You cannot remove yourself")
+            target, owners = _lock_member(conn, user, user_id)
+            if target["role"] == UserRole.OWNER.value and owners <= 1:
+                raise HTTPException(409, "The company must keep at least one owner")
+            conn.execute(text("DELETE FROM users WHERE user_id = :u AND org_id = :o"),
+                         {"u": str(user_id), "o": str(user.org_id)})
+
+    await run_in_threadpool(run)
+    return Response(status_code=204)
 
 
 # ----------------------------------------------------------------------------- dashboard

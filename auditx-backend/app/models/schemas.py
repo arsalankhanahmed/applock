@@ -220,6 +220,12 @@ class UserOut(BaseModel):
     created_at: datetime
 
 
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    role: Optional[UserRole] = None
+    password: Optional[str] = Field(default=None, min_length=10, max_length=128)
+
+
 # ---------------------------------------------------------------- maker-checker
 class ApprovalPolicyIn(BaseModel):
     auto_heal_mode: AutoHealMode = AutoHealMode.THRESHOLD

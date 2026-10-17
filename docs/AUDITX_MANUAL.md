@@ -120,6 +120,7 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | POST | `/approvals/bulk-approve` | `{"request_ids": [...]}`; each request is checked on its own, failures listed |
 | GET / PUT | `/approval-policy` | Read / change the tenant's approval policy (PUT: OWNER / ADMIN) |
 | GET / POST | `/users` | List team members / add one (OWNER / ADMIN), e.g. an AUDITOR to act as checker |
+| PATCH / DELETE | `/users/{user_id}` | Change a member's role or name, reset their password / remove them (OWNER / ADMIN) |
 | GET | `/dashboard/metrics` | KPIs, per-channel and per-issue exposure, root causes, per-courier COD ledger |
 | POST | `/agent/query` | `{"question": "..."}` → SQL, rows, narrative |
 
@@ -201,7 +202,26 @@ as open leakage until approved. Re-running reconciliation keeps pending findings
 rejected is not proposed again for the same finding.
 
 The seeder creates a checker login next to the owner (`demo+checker@auditx.io`, same password, role
-AUDITOR), so the workflow can be tried straight away. Add real team members with `POST /api/v1/users`.
+AUDITOR), so the workflow can be tried straight away. Add real team members from the **Team** panel.
+
+### 4.5 Team members and roles
+
+The **Team** panel (header link "Team") lists everyone in the company. Owners and admins can add members,
+change roles, reset passwords and remove people:
+
+| Role | Can do |
+|------|--------|
+| OWNER | Everything, including other owners, the approval policy and the team |
+| ADMIN | Manage the team (not owners) and the approval policy; approve |
+| ANALYST | Upload files, run reconciliation, propose fixes (maker) |
+| AUDITOR | Approve or reject fixes (checker); can also propose |
+| VIEWER | Read-only dashboard and chat |
+
+Rules: only an owner can create, change or remove an owner; nobody can change their own role or remove
+themselves; a company always keeps at least one owner. New members get a temporary password (the
+**Generate** button makes a strong one), shown once to share privately. Roles are read from the database
+on every request, so a role change or removal takes effect immediately, even for someone already signed in.
+A removed member's approval history stays, with their email on each request.
 
 ## 5. Security model of the Forensic Agent
 
