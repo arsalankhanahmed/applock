@@ -94,7 +94,7 @@ async def current_user(request: Request, creds: Optional[HTTPAuthorizationCreden
                             headers={"WWW-Authenticate": "Bearer"})
     try:
         claims = jwt.decode(creds.credentials, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM],
-                            issuer="auditx")
+                            issuer="auditx", options={"require": ["exp", "iat", "sub", "iss"]})
         user_id, org_id, issued_at = UUID(claims["sub"]), UUID(claims["org"]), int(claims["iat"])
     except (jwt.PyJWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Invalid token: {exc}",
@@ -194,6 +194,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def reject_nul_characters(request: Request, call_next: Callable) -> Response:
+    """PostgreSQL text cannot hold NUL; refuse such input up front instead of failing with a 500."""
+    if "%00" in request.url.query or "%00" in request.url.path:
+        return JSONResponse(status_code=422, content={"detail": "Request contains a NUL character"})
+    if request.headers.get("content-type", "").startswith(("application/json", "application/x-www-form-urlencoded")):
+        body = await request.body()
+        if b"\\u0000" in body or b"\x00" in body:
+            return JSONResponse(status_code=422, content={"detail": "Request contains a NUL character"})
+    return await call_next(request)
 
 
 @app.exception_handler(approvals.ApprovalError)

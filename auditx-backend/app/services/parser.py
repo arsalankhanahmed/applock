@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import BinaryIO, Callable, Dict, List, Optional
 from uuid import UUID
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
@@ -79,12 +80,28 @@ _CURRENCY_SYMBOLS = re.compile(r"[$€£₹¥₨﷼]")
 _WHITESPACE = re.compile(r"[\s  ']")
 _EUROPEAN_FORMAT = re.compile(r"^-?[\d.]*\d,\d{1,2}-?$")
 _NON_NUMERIC = re.compile(r"[^0-9.\-]")
+_SCIENTIFIC = re.compile(r"^-?(\d+\.?\d*|\.\d+)[eE][-+]?\d+$")
+
+# float64 holds whole cents exactly only below ~9e13; anything larger is a corrupt cell, not money.
+MAX_ABS_AMOUNT = 1e13
+# Column widths of the canonical tables; longer text would abort the whole COPY, so the row is rejected.
+TEXT_LIMITS = {"bank_account": 64, "courier_name": 64, "description": None}
+DEFAULT_TEXT_LIMIT = 128
 _ISO_CURRENCY = re.compile(r"([A-Za-z]{3})")
 _HEADER_NORMALISER = re.compile(r"[^a-z0-9]")
 
 
 def normalise_header(name: str) -> str:
     return _HEADER_NORMALISER.sub("", str(name).strip().lower())
+
+
+def round_cents(values: pd.Series) -> pd.Series:
+    """Round to cents half away from zero, as accounting does (0.005 -> 0.01, 2.675 -> 2.68).
+
+    pandas' round() is half-to-even on binary floats, so 0.005 -> 0.00 and 2.675 -> 2.67; the tiny epsilon
+    absorbs the float representation error of values that are exactly half a cent in decimal."""
+    numeric = pd.to_numeric(values, errors="coerce").astype("float64")
+    return np.sign(numeric) * np.floor(np.abs(numeric) * 100 + 0.5 + 1e-9) / 100
 
 
 def clean_currency_series(raw: pd.Series) -> pd.Series:
@@ -97,16 +114,18 @@ def clean_currency_series(raw: pd.Series) -> pd.Series:
     s = s.str.replace(_CURRENCY_SYMBOLS, "", regex=True)
     s = s.str.replace(_WHITESPACE, "", regex=True)
     s = s.str.replace(r"[()]", "", regex=True)
+    scientific = s.str.match(_SCIENTIFIC).fillna(False)              # Excel exports: 1.25E+05
 
     european = s.str.match(_EUROPEAN_FORMAT).fillna(False)
     s = s.where(~european, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
     s = s.str.replace(",", "", regex=False)
-    s = s.str.replace(_NON_NUMERIC, "", regex=True)
+    s = s.where(scientific, s.str.replace(_NON_NUMERIC, "", regex=True))
     s = s.str.rstrip("-")
 
     values = pd.to_numeric(s, errors="coerce")
+    values = values.where(values.abs() < MAX_ABS_AMOUNT)
     values = values.where(~(negative_parentheses | trailing_minus), -values.abs())
-    return values.round(2)
+    return round_cents(values)
 
 
 def clean_string_series(raw: pd.Series) -> pd.Series:
@@ -207,7 +226,7 @@ def apply_numeric_ops(series: pd.Series, ops: List[tuple]) -> pd.Series:
             series = -series
         elif op == "abs":
             series = series.abs()
-    return series.round(2)
+    return round_cents(series)
 
 
 # --------------------------------------------------------------------------- mapping resolution
@@ -257,8 +276,15 @@ def _org_currency(org_id: UUID) -> str:
     return value
 
 
-def _sniff_dialect(stream: BinaryIO) -> str:
-    sample = stream.read(64 * 1024).decode("utf-8-sig", errors="replace")
+def _detect_encoding(stream: BinaryIO) -> str:
+    """Excel's "Unicode Text" export is UTF-16 with a BOM; everything else is read as UTF-8."""
+    head = stream.read(2)
+    stream.seek(0)
+    return "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+
+
+def _sniff_dialect(stream: BinaryIO, encoding: str = "utf-8-sig") -> str:
+    sample = stream.read(64 * 1024).decode(encoding, errors="replace")
     stream.seek(0)
     try:
         return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
@@ -331,6 +357,7 @@ def transform_chunk(
     `context` carries state across chunks of one file (bank fingerprint occurrence counters)."""
     context = {} if context is None else context
     out = pd.DataFrame(index=chunk.index)
+    too_long = pd.Series(False, index=chunk.index)
     for standard_name, rule in rules.items():
         raw = chunk[standard_name] if standard_name in chunk.columns else pd.Series(pd.NA, index=chunk.index, dtype="string")
         if rule.default is not None:
@@ -344,6 +371,9 @@ def transform_chunk(
             out[standard_name] = clean_currency_code_series(raw, default_currency)
         else:
             out[standard_name] = apply_string_ops(clean_string_series(raw), rule.ops)
+            limit = TEXT_LIMITS.get(standard_name, DEFAULT_TEXT_LIMIT)
+            if limit:
+                too_long |= out[standard_name].str.len().gt(limit).fillna(False)
 
     if target_table == "gateway_transactions":
         gross, net, fee = out["gross_amount"], out["net_amount"], out["fee_amount"]
@@ -373,7 +403,7 @@ def transform_chunk(
         out["net_remitted"] = out["net_remitted"].fillna(fallback)
 
     required = [name for name, rule in rules.items() if rule.is_required] + DERIVED_REQUIRED.get(target_table, [])
-    valid_mask = out[required].notna().all(axis=1)
+    valid_mask = out[required].notna().all(axis=1) & ~too_long
     rejected = int((~valid_mask).sum())
     clean = out.loc[valid_mask, TARGET_COLUMNS[target_table]]
     return clean, rejected
@@ -464,9 +494,10 @@ def parse_stream(
     """Parse a binary CSV stream chunk-by-chunk into the tenant's canonical table."""
     rules = load_field_rules(org_id, target_table)
     default_currency = _org_currency(org_id)
-    delimiter = _sniff_dialect(stream)
+    encoding = _detect_encoding(stream)
+    delimiter = _sniff_dialect(stream, encoding)
 
-    header = pd.read_csv(stream, nrows=0, sep=delimiter, encoding="utf-8-sig", encoding_errors="replace").columns.tolist()
+    header = pd.read_csv(stream, nrows=0, sep=delimiter, encoding=encoding, encoding_errors="replace").columns.tolist()
     stream.seek(0)
     column_map = _resolve_columns(header, rules)
     report = ParseReport(target_table=target_table, column_map=column_map)
@@ -478,7 +509,7 @@ def parse_stream(
         dtype=str,
         usecols=list(column_map.keys()),
         chunksize=chunk_rows or settings.PARSER_CHUNK_ROWS,
-        encoding="utf-8-sig",
+        encoding=encoding,
         encoding_errors="replace",
         on_bad_lines="skip",
         skip_blank_lines=True,

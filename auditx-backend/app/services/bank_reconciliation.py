@@ -58,7 +58,7 @@ SETTLEMENT_KEYWORDS = re.compile(
     r"(?i)\b(?:stripe|paypal|razorpay|adyen|checkout\.com|payfast|jazzcash|easypaisa|safepay|hbl\s?pay|"
     r"shopify|payout|settlement|remittance|cpr|cod|tcs|leopards|postex|trax|m&p|callcourier|daraz|blueex|rider)\b"
 )
-_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-/]{4,}")
+_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{2,}")
 
 
 def _empty() -> pd.DataFrame:
@@ -79,15 +79,33 @@ def _finding(frame: pd.DataFrame, ref_col: str, issue: str, expected: pd.Series,
 
 
 def _reference_matches(settlements: pd.DataFrame, credits: pd.DataFrame) -> pd.DataFrame:
-    tokens = credits[["bank_reference", "description"]].copy()
-    tokens["token"] = (tokens["description"].fillna("") + " " + tokens["bank_reference"]).map(
-        lambda s: list({t.upper() for t in _TOKEN.findall(s)})
-    )
+    """Pair batches with credits whose narration or bank reference carries the batch id.
+
+    Fast path: exact token join (narrations split on spaces, slashes and other separators). Fallback for the
+    few batches left: the id appears inside a longer token (e.g. "CPR-TCS-77-WK41"), not glued to letters or
+    digits on either side."""
+    text_by_credit = (credits["description"].fillna("") + " " + credits["bank_reference"]).str.upper()
+    tokens = pd.DataFrame({"bank_reference": credits["bank_reference"],
+                           "token": text_by_credit.map(lambda s: list(set(_TOKEN.findall(s))))})
     tokens = tokens.explode("token").dropna(subset=["token"])
     keyed = settlements.assign(token=settlements["reference"].str.upper())
     pairs = keyed.merge(tokens[["bank_reference", "token"]], on="token")
-    pairs = pairs.drop_duplicates("reference").drop_duplicates("bank_reference")
-    return pairs[["reference", "bank_reference"]]
+    pairs = pairs.drop_duplicates("reference").drop_duplicates("bank_reference")[["reference", "bank_reference"]]
+
+    left = settlements[~settlements["reference"].isin(pairs["reference"])]
+    free = dict(zip(credits["bank_reference"], text_by_credit))
+    for ref in pairs["bank_reference"]:
+        free.pop(ref, None)
+    extra = []
+    for reference in left["reference"]:
+        pattern = re.compile(r"(?<![A-Z0-9])" + re.escape(reference.upper()) + r"(?![A-Z0-9])")
+        hit = next((b for b, t in free.items() if reference.upper() in t and pattern.search(t)), None)
+        if hit is not None:
+            extra.append({"reference": reference, "bank_reference": hit})
+            free.pop(hit)
+    if extra:
+        pairs = pd.concat([pairs, pd.DataFrame(extra)], ignore_index=True)
+    return pairs
 
 
 def _amount_matches(settlements: pd.DataFrame, credits: pd.DataFrame) -> pd.DataFrame:

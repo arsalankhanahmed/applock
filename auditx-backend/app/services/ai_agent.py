@@ -146,7 +146,10 @@ _DANGEROUS_FUNCS_RE = re.compile(
     r"version|inet_\w+|current_user|session_user|has_\w+_privilege)\s*\(",
     re.IGNORECASE,
 )
-_SENSITIVE_RE = re.compile(r"\b(users|password_hash|email|client_field_mappings|audit_jobs)\b", re.IGNORECASE)
+_SENSITIVE_RE = re.compile(
+    r"\b(users|password_hash|email|client_field_mappings|audit_jobs|invitations|token_hash|approval_policies)\b",
+    re.IGNORECASE,
+)
 _TENANT_PREDICATE_RE = re.compile(r"(?:\b[a-z_][a-z0-9_]*\.)?\borg_id\s*=\s*:org_id\b", re.IGNORECASE)
 _OTHER_BINDS_RE = re.compile(r"(?<![:\w]):(?!org_id\b)([a-z_]\w*)", re.IGNORECASE)
 _LIMIT_RE = re.compile(r"\blimit\s+(\d+)\s*$", re.IGNORECASE)
@@ -164,6 +167,7 @@ TENANT_VIEWS = {
         "proposed_by_type, status, created_at, decided_at FROM public.resolution_requests WHERE org_id = '{org}'"
     ),
     "approval_policies": "SELECT NULL::uuid AS org_id WHERE FALSE",
+    "invitations": "SELECT NULL::uuid AS invite_id, NULL::uuid AS org_id WHERE FALSE",
     "users": "SELECT NULL::uuid AS user_id, NULL::uuid AS org_id WHERE FALSE",
     "client_field_mappings": "SELECT NULL::uuid AS mapping_id, NULL::uuid AS org_id WHERE FALSE",
     "audit_jobs": "SELECT NULL::uuid AS job_id, NULL::uuid AS org_id WHERE FALSE",
