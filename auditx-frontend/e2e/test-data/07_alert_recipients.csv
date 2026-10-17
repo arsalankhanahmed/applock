@@ -1,0 +1,3 @@
+name,channel,address,consent,expected
+Ayesha Finance,WHATSAPP,+92 300 1234567,yes,accepted and stored as +923001234567
+Local Number,WHATSAPP,03001234567,yes,refused: must be international format (+92...)

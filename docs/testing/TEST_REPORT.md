@@ -2,27 +2,38 @@
 
 | Item | Value |
 |---|---|
-| Build under test | branch `ccr-4b6a270d-we3a5h` (AuditX 1.0.0 + Recovery & Claims) |
+| Build under test | branch `ccr-4b6a270d-we3a5h` (AuditX 1.0.0 + Recovery & Claims + WhatsApp alerts) |
 | Test date | 2026-10-17 |
 | Environment | Linux, Python 3.13, PostgreSQL 16, Redis 7, Celery 5 (eager for backend tests, real worker for UI tests), Node 20, Next.js 14.2, Chromium (Playwright 1.56.1) |
 | Strategy | [TEST_STRATEGY.md](TEST_STRATEGY.md) · cases: [USE_CASES.md](USE_CASES.md), [BUSINESS_TEST_CASES.md](BUSINESS_TEST_CASES.md) |
 
 ## 1. Summary
 
-**All 333 automated tests pass.** Testing found **11 defects** (3 High, 3 Medium, 5 Low). All are fixed and each has a regression test. There are no open defects.
+**All 391 automated tests pass.** Testing found **11 defects** (3 High, 3 Medium, 5 Low). All are fixed and each has a regression test. There are no open defects.
 
 | Suite | Kind | Tests | Passed | Failed | Time |
 |---|---|---:|---:|---:|---:|
-| `tests/unit` | White box | 171 | 171 | 0 | 2.1 s |
-| `tests/integration` | Integration with PostgreSQL | 55 | 55 | 0 | 16 s |
-| `tests/api` | Black box (HTTP) | 60 | 60 | 0 | 52.0 s |
-| `tests/regression` | Regression and planted-vs-found | 27 | 27 | 0 | 7.1 s |
-| **Backend total** | | **313** | **313** | **0** | 85 s |
-| `auditx-frontend/e2e` | Black-box UI, desktop Chromium | 19 | 19 | 0 | 48 s (full suite run 3 times, the last on the final build) |
+| `tests/unit` | White box | 202 | 202 | 0 | 2.2 s |
+| `tests/integration` | Integration with PostgreSQL | 64 | 64 | 0 | 18 s |
+| `tests/api` | Black box (HTTP) | 74 | 74 | 0 | 70 s |
+| `tests/regression` | Regression and planted-vs-found | 27 | 27 | 0 | 7.7 s |
+| **Backend total** | | **367** | **367** | **0** | 114 s |
+| `auditx-frontend/e2e` | Black-box UI, desktop Chromium | 23 | 23 | 0 | 58 s (two consecutive full runs) |
 | `auditx-frontend/e2e` | Black-box UI, mobile (Pixel 7) | 1 | 1 | 0 | |
-| **Grand total** | | **333** | **333** | **0** | |
+| **Grand total** | | **391** | **391** | **0** | |
 
-Business test cases BTC-01 to BTC-45 all **pass** ([traceability](BUSINESS_TEST_CASES.md)).
+Business test cases BTC-01 to BTC-53 all **pass** ([traceability](BUSINESS_TEST_CASES.md)).
+
+**WhatsApp alerts (latest release)** add 58 tests: 31 unit, 9 integration, 14 API and 4 UI scenarios (UC-17 to UC-19, BTC-46 to BTC-53). They cover:
+- off by default, with only Owner / Admin able to switch alerts on;
+- recipient consent and phone-number validation;
+- digest content, thresholds and sections;
+- daily and weekly scheduling in the tenant's time zone;
+- one digest per period, with retries capped at 3 and interrupted sends released;
+- Meta / Twilio / log providers, including error and timeout handling;
+- the protected cron endpoint;
+- masked delivery logs;
+- tenant isolation, and the forensic agent being unable to read alert tables.
 
 **Recovery & Claims (this release)** adds 40 tests: 11 unit, 14 integration, 10 API, 1 regression and 4 UI scenarios (UC-14 to UC-16, BTC-35 to BTC-45). They cover:
 - claimable rules;
@@ -45,19 +56,21 @@ Static checks: `tsc --noEmit` is clean, `next lint` reports no warnings or error
 | services/approvals.py | 88 | 0 | **100%** |
 | services/bank_reconciliation.py | 93 | 0 | **100%** |
 | services/cod_reconciliation.py | 84 | 0 | **100%** |
-| models/schemas.py | 426 | 0 | **100%** |
-| services/recovery.py *(new)* | 311 | 9 | 97% |
+| models/schemas.py | 494 | 0 | **100%** |
+| config.py | 80 | 2 | 98% |
+| services/reconciliation.py | 121 | 3 | 98% |
+| services/recovery.py | 311 | 9 | 97% |
 | services/auto_healer.py | 261 | 7 | 97% |
-| services/reconciliation.py | 117 | 3 | 97% |
-| config.py | 67 | 2 | 97% |
-| services/mailer.py | 57 | 2 | 96% |
+| services/mailer.py | 66 | 2 | 97% |
+| services/alerts.py *(new)* | 239 | 10 | 96% |
 | services/parser.py | 320 | 17 | 95% |
-| main.py | 523 | 33 | 94% |
+| main.py | 568 | 33 | 94% |
+| services/whatsapp.py *(new)* | 86 | 6 | 93% |
 | utils/seeder.py | 331 | 30 | 91% |
-| workers/tasks.py | 55 | 6 | 89% |
+| workers/tasks.py | 59 | 8 | 86% |
 | services/ai_agent.py | 178 | 25 | 86% (the uncovered lines are the live OpenAI HTTP calls, which are mocked) |
 | database.py | 36 | 14 | 61% (engine and pool bootstrapping) |
-| **Total** | **2947** | **148** | **95%** |
+| **Total** | **3415** | **166** | **95%** |
 
 The exit criterion "`app/services` ≥ 85%" is met: every service module is between 86% and 100%.
 
@@ -116,6 +129,7 @@ Time-boxed, about 45 minutes. Each probe is listed with its observation. Probes 
 ## 5. Risks and limitations
 
 * **Live OpenAI path:** the LLM is mocked in tests (retry, refusal and narrative paths are covered). Every query it produces still goes through the same guard and sandbox, which are fully tested.
+* **Real WhatsApp delivery:** Meta and Twilio calls are tested against mocked HTTP responses in their documented format, and the UI runs with the `log` provider. Sending through a live WhatsApp Business account needs an approved template and was not tested.
 * **Real SMTP delivery:** the tests use a fake SMTP server and the "no SMTP" link fallback. Delivery against a real provider was verified manually earlier with a local SMTP sink.
 * **Load:** about 3,000 orders per seed run in the automated suite. Earlier manual runs reconciled 10,000+ orders in under a second, but no formal load test was run.
 * **Browsers:** UI automation runs on Chromium (desktop and mobile emulation). Firefox and WebKit were not run.

@@ -174,3 +174,39 @@ Verified by: BTC-38, BTC-39, BTC-40, BTC-42
 * **E1** A finding closed by a person is not treated as payment. **E2** Data matches and recorded payments never add up to more than the claim.
 
 Verified by: BTC-43, BTC-44
+
+### UC-17 Switch WhatsApp alerts on for a client (optional)
+**Actor:** Owner / Admin · **Pre:** the client asked for alerts
+
+1. Admin opens **WhatsApp Alerts**, which shows *Off* and what this server can send (WhatsApp provider, email).
+2. Admin ticks *Send alerts for this company* and picks daily or weekly, the send hour, time zone, minimum amount, overdue days and sections.
+3. **Save**: the badge shows *On · daily at 08:00*.
+
+* **E1** Unknown time zone, hour outside 0–23, unknown frequency, negative amount → 422.
+* **E2** Analyst, Auditor, Viewer → no panel; API 403.
+
+Verified by: BTC-46, BTC-47, BTC-52
+
+### UC-18 Add recipients, preview and send a test
+**Actor:** Owner / Admin
+
+1. Admin adds a recipient: name, WhatsApp number or email, and ticks that the person agreed to receive alerts.
+2. The **preview** shows the next message.
+3. **Send test now** sends it immediately (even while alerts are off). *Recent deliveries* shows the result with the address masked.
+
+* **E1** No consent → Add is disabled / 422. **E2** Local number (`0300…`) → "international format". **E3** Same number twice → 409.
+* **E4** WhatsApp not configured on the server → test shows *Not sent: WhatsApp is not configured*, recorded as FAILED.
+
+Verified by: BTC-48, BTC-49, BTC-50
+
+### UC-19 Scheduled digest delivery
+**Actor:** System (Celery beat every 15 minutes, or a cron job calling the protected endpoint)
+
+1. For each company with alerts on, once the local send time has passed (daily) or Monday's send time has passed (weekly), each active recipient gets the digest.
+2. Each recipient gets at most one digest per period, however often the job runs.
+
+* **A1** Nothing to report and *all clear* off → recorded as SKIPPED, nothing sent.
+* **E1** Send fails → retried on later runs, up to 3 attempts. **E2** Process died mid-send → released for retry after 15 minutes.
+* **E3** Cron endpoint without the right token → 403 (404 when no token is configured).
+
+Verified by: BTC-51, BTC-53

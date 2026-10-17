@@ -321,6 +321,58 @@ CREATE TABLE IF NOT EXISTS recovery_events (
 );
 CREATE INDEX IF NOT EXISTS ix_recovery_events_claim ON recovery_events (claim_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_recovery_events_org ON recovery_events (org_id, kind, occurred_on);
+
+-- Alerts: an optional WhatsApp / email digest. Off until a tenant's admin switches it on.
+CREATE TABLE IF NOT EXISTS alert_settings (
+    org_id               UUID PRIMARY KEY REFERENCES organizations(org_id) ON DELETE CASCADE,
+    enabled              BOOLEAN NOT NULL DEFAULT FALSE,
+    frequency            VARCHAR(8) NOT NULL DEFAULT 'DAILY' CHECK (frequency IN ('DAILY', 'WEEKLY')),
+    send_hour            SMALLINT NOT NULL DEFAULT 9 CHECK (send_hour BETWEEN 0 AND 23),
+    timezone             VARCHAR(64) NOT NULL DEFAULT 'Asia/Karachi',
+    min_amount           NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (min_amount >= 0),
+    cod_overdue_days     SMALLINT NOT NULL DEFAULT 7 CHECK (cod_overdue_days BETWEEN 1 AND 90),
+    include_cod          BOOLEAN NOT NULL DEFAULT TRUE,
+    include_settlements  BOOLEAN NOT NULL DEFAULT TRUE,
+    include_approvals    BOOLEAN NOT NULL DEFAULT TRUE,
+    include_recovery     BOOLEAN NOT NULL DEFAULT TRUE,
+    send_when_clear      BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by_email     VARCHAR(320)
+);
+
+CREATE TABLE IF NOT EXISTS alert_recipients (
+    recipient_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id            UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name              VARCHAR(255) NOT NULL,
+    channel           VARCHAR(10) NOT NULL CHECK (channel IN ('WHATSAPP', 'EMAIL')),
+    address           VARCHAR(320) NOT NULL,
+    active            BOOLEAN NOT NULL DEFAULT TRUE,
+    consent_at        TIMESTAMPTZ NOT NULL,
+    created_by_email  VARCHAR(320),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_alert_recipient UNIQUE (org_id, channel, address)
+);
+
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    delivery_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id               UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    recipient_id         UUID REFERENCES alert_recipients(recipient_id) ON DELETE SET NULL,
+    channel              VARCHAR(10) NOT NULL,
+    address_masked       VARCHAR(64) NOT NULL,
+    kind                 VARCHAR(8) NOT NULL CHECK (kind IN ('DIGEST', 'TEST')),
+    period_key           VARCHAR(16) NOT NULL,
+    status               VARCHAR(8) NOT NULL CHECK (status IN ('SENDING', 'SENT', 'FAILED', 'SKIPPED')),
+    provider             VARCHAR(16),
+    provider_message_id  VARCHAR(128),
+    error                TEXT,
+    summary              TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at          TIMESTAMPTZ
+);
+-- At most one digest in flight or delivered per recipient per period; failed attempts don't block a retry.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_alert_digest_once
+    ON alert_deliveries (recipient_id, period_key) WHERE kind = 'DIGEST' AND status IN ('SENDING', 'SENT', 'SKIPPED');
+CREATE INDEX IF NOT EXISTS ix_alert_deliveries_org ON alert_deliveries (org_id, created_at DESC);
 """
 
 # Core canonical schema every client ERP / gateway export is mapped onto.

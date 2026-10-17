@@ -1832,6 +1832,383 @@ function ClaimView({
   );
 }
 
+/* ============================================================================
+ * Alerts (optional WhatsApp / email digest)
+ * ========================================================================== */
+interface AlertSettings {
+  enabled: boolean;
+  frequency: "DAILY" | "WEEKLY";
+  send_hour: number;
+  timezone: string;
+  min_amount: Money;
+  cod_overdue_days: number;
+  include_cod: boolean;
+  include_settlements: boolean;
+  include_approvals: boolean;
+  include_recovery: boolean;
+  send_when_clear: boolean;
+  updated_at?: string | null;
+  updated_by_email?: string | null;
+  channels?: {
+    whatsapp_provider: string | null;
+    whatsapp_ready: boolean;
+    whatsapp_problem: string | null;
+    email_ready: boolean;
+    scheduler: string;
+  };
+}
+
+interface AlertRecipient {
+  recipient_id: string;
+  name: string;
+  channel: "WHATSAPP" | "EMAIL";
+  address: string;
+  active: boolean;
+  consent_at: string;
+}
+
+interface AlertPreviewData {
+  lines: string[];
+  whatsapp_summary: string;
+  has_content: boolean;
+  next_period: string | null;
+}
+
+interface AlertTestResultRow {
+  name: string;
+  channel: string;
+  sent: boolean;
+  provider: string | null;
+  error: string | null;
+}
+
+interface AlertDelivery {
+  delivery_id: string;
+  recipient_name: string | null;
+  channel: string;
+  address_masked: string;
+  kind: string;
+  period_key: string;
+  status: "SENDING" | "SENT" | "FAILED" | "SKIPPED";
+  provider: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+const ALERT_SETTING_KEYS = [
+  "enabled",
+  "frequency",
+  "send_hour",
+  "timezone",
+  "min_amount",
+  "cod_overdue_days",
+  "include_cod",
+  "include_settlements",
+  "include_approvals",
+  "include_recovery",
+  "send_when_clear",
+] as const;
+
+/** Only the editable fields; read-only ones (channels, updated_at) stay out of the PUT. */
+const alertSettingsBody = (form: AlertSettings) => Object.fromEntries(ALERT_SETTING_KEYS.map((k) => [k, form[k]]));
+
+const DELIVERY_TONE: Record<AlertDelivery["status"], string> = {
+  SENT: "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30",
+  FAILED: TONE.rose,
+  SKIPPED: "text-slate-300 bg-slate-500/10 ring-slate-500/30",
+  SENDING: TONE.sky,
+};
+
+function AlertsPanel({ token, refreshKey }: { token: string; refreshKey: number }) {
+  const [form, setForm] = useState<AlertSettings | null>(null);
+  const [recipients, setRecipients] = useState<AlertRecipient[]>([]);
+  const [preview, setPreview] = useState<AlertPreviewData | null>(null);
+  const [log, setLog] = useState<AlertDelivery[]>([]);
+  const [draft, setDraft] = useState({ name: "", channel: "WHATSAPP" as AlertRecipient["channel"], address: "", consent: false });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [localKey, setLocalKey] = useState(0);
+  const reload = useCallback(() => setLocalKey((k) => k + 1), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      api<AlertSettings>("/api/v1/alerts/settings", token),
+      api<AlertRecipient[]>("/api/v1/alerts/recipients", token),
+      api<AlertPreviewData>("/api/v1/alerts/preview", token),
+      api<AlertDelivery[]>("/api/v1/alerts/deliveries?limit=10", token),
+    ])
+      .then(([s, r, p, d]) => {
+        if (cancelled) return;
+        setForm(s);
+        setRecipients(r);
+        setPreview(p);
+        setLog(d);
+      })
+      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "Could not load alerts"));
+    return () => {
+      cancelled = true;
+    };
+  }, [token, refreshKey, localKey]);
+
+  async function run(name: string, fn: () => Promise<string | void>) {
+    setBusy(name);
+    setError(null);
+    setNotice(null);
+    try {
+      const message = await fn();
+      if (message) setNotice(message);
+      reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Action failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (!form) {
+    return (
+      <Card title="WhatsApp Alerts">
+        {error ? <p className="text-xs text-rose-300">{error}</p> : <Skeleton className="h-24" />}
+      </Card>
+    );
+  }
+
+  const ch = form.channels;
+  const field = "rounded-md border border-ink-600 bg-ink-850 px-2 py-1 text-xs text-slate-100 outline-none focus:border-emerald-500";
+  const check = "h-4 w-4 accent-emerald-500";
+  const set = <K extends keyof AlertSettings>(key: K, value: AlertSettings[K]) => setForm({ ...form, [key]: value });
+  const sections: { key: "include_cod" | "include_settlements" | "include_approvals" | "include_recovery"; label: string }[] = [
+    { key: "include_cod", label: "COD stuck with couriers" },
+    { key: "include_settlements", label: "Payouts not in the bank" },
+    { key: "include_approvals", label: "Fixes waiting for a checker" },
+    { key: "include_recovery", label: "Claims & recovery" },
+  ];
+
+  return (
+    <Card
+      title="WhatsApp Alerts"
+      action={
+        <Badge className={form.enabled ? "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30" : "text-slate-300 bg-slate-500/10 ring-slate-500/30"}>
+          {form.enabled ? `On · ${form.frequency === "DAILY" ? "daily" : "weekly"} at ${String(form.send_hour).padStart(2, "0")}:00` : "Off"}
+        </Badge>
+      }
+    >
+      <div className="space-y-4 text-xs" data-testid="alerts-panel">
+        <p className="text-slate-400">
+          Optional: a short daily or weekly summary of what needs attention, sent on WhatsApp or email. It stays off until this company asks for it.
+        </p>
+        {ch && (
+          <div className="flex flex-wrap gap-2">
+            <Badge className={ch.whatsapp_ready ? "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30" : TONE.amber}>
+              {ch.whatsapp_ready ? `WhatsApp ready (${ch.whatsapp_provider === "log" ? "log only: test mode" : ch.whatsapp_provider})` : "WhatsApp not set up on this server"}
+            </Badge>
+            <Badge className={ch.email_ready ? "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30" : "text-slate-300 bg-slate-500/10 ring-slate-500/30"}>
+              {ch.email_ready ? "Email ready" : "Email not set up"}
+            </Badge>
+          </div>
+        )}
+        {ch?.whatsapp_problem && <p className="text-[11px] text-amber-200/80">{ch.whatsapp_problem}</p>}
+        {error && <p className="rounded-md bg-rose-500/10 px-3 py-2 text-rose-300">{error}</p>}
+        {notice && <p className="rounded-md bg-emerald-500/10 px-3 py-2 text-emerald-200">{notice}</p>}
+
+        <form
+          className="rounded-xl border border-ink-700 bg-ink-850/60 p-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void run("save", async () => {
+              await api<AlertSettings>("/api/v1/alerts/settings", token, { method: "PUT", body: JSON.stringify(alertSettingsBody(form)) });
+              return form.enabled ? "Alerts are on." : "Alerts settings saved (alerts are off).";
+            });
+          }}
+        >
+          <label className="mb-3 flex items-center gap-2 text-sm text-slate-100">
+            <input type="checkbox" className={check} checked={form.enabled} onChange={(e) => set("enabled", e.target.checked)} aria-label="Send alerts" />
+            Send alerts for this company
+          </label>
+          <div className="grid gap-3 md:grid-cols-3">
+            <label className="flex flex-col gap-1 text-slate-400">
+              How often
+              <select aria-label="Alert frequency" value={form.frequency} onChange={(e) => set("frequency", e.target.value as AlertSettings["frequency"])} className={field}>
+                <option value="DAILY">Every day</option>
+                <option value="WEEKLY">Every Monday</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1 text-slate-400">
+              Send at
+              <select aria-label="Send hour" value={form.send_hour} onChange={(e) => set("send_hour", Number(e.target.value))} className={field}>
+                {Array.from({ length: 24 }).map((_, h) => (
+                  <option key={h} value={h}>
+                    {String(h).padStart(2, "0")}:00
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1 text-slate-400">
+              Time zone
+              <input aria-label="Time zone" value={form.timezone} onChange={(e) => set("timezone", e.target.value)} className={field} />
+            </label>
+            <label className="flex flex-col gap-1 text-slate-400">
+              Ignore items below
+              <input aria-label="Minimum amount" inputMode="decimal" value={String(form.min_amount)} onChange={(e) => set("min_amount", e.target.value)} className={field} />
+            </label>
+            <label className="flex flex-col gap-1 text-slate-400">
+              COD is overdue after (days)
+              <input aria-label="COD overdue days" type="number" min={1} max={90} value={form.cod_overdue_days} onChange={(e) => set("cod_overdue_days", Number(e.target.value))} className={field} />
+            </label>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 text-slate-300">
+            {sections.map((s) => (
+              <label key={s.key} className="flex items-center gap-1.5">
+                <input type="checkbox" className={check} checked={form[s.key]} onChange={(e) => set(s.key, e.target.checked)} />
+                {s.label}
+              </label>
+            ))}
+            <label className="flex items-center gap-1.5">
+              <input type="checkbox" className={check} checked={form.send_when_clear} onChange={(e) => set("send_when_clear", e.target.checked)} />
+              Also send on quiet days (&quot;all clear&quot;)
+            </label>
+          </div>
+          <div className="mt-3 flex justify-end">
+            <button type="submit" disabled={busy === "save"} className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1.5 font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-60">
+              {busy === "save" && <Spinner className="h-3 w-3" />} Save alert settings
+            </button>
+          </div>
+        </form>
+
+        <div>
+          <p className="mb-2 font-semibold uppercase tracking-wider text-slate-500">Recipients</p>
+          {recipients.length === 0 ? (
+            <p className="mb-2 text-slate-500">No one receives alerts yet.</p>
+          ) : (
+            <ul className="mb-3 divide-y divide-ink-800 rounded-xl border border-ink-700">
+              {recipients.map((r) => (
+                <li key={r.recipient_id} className="flex flex-wrap items-center gap-3 px-3 py-2" data-testid="alert-recipient">
+                  <span className="font-medium text-slate-100">{r.name}</span>
+                  <Badge className={r.channel === "WHATSAPP" ? "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30" : TONE.sky}>
+                    {r.channel === "WHATSAPP" ? "WhatsApp" : "Email"}
+                  </Badge>
+                  <span className="font-mono text-slate-400">{r.address}</span>
+                  <label className="ml-auto flex items-center gap-1.5 text-slate-400">
+                    <input
+                      type="checkbox"
+                      className={check}
+                      checked={r.active}
+                      aria-label={`Active: ${r.name}`}
+                      onChange={(e) =>
+                        void run(`toggle-${r.recipient_id}`, async () => {
+                          await api(`/api/v1/alerts/recipients/${r.recipient_id}`, token, {
+                            method: "PATCH",
+                            body: JSON.stringify({ active: e.target.checked }),
+                          });
+                        })
+                      }
+                    />
+                    Active
+                  </label>
+                  <button
+                    onClick={() =>
+                      void run(`remove-${r.recipient_id}`, async () => {
+                        await api(`/api/v1/alerts/recipients/${r.recipient_id}`, token, { method: "DELETE" });
+                        return `${r.name} no longer receives alerts.`;
+                      })
+                    }
+                    className="rounded-md border border-rose-500/40 px-2 py-0.5 text-[11px] text-rose-300 hover:bg-rose-500/10"
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <form
+            className="flex flex-wrap items-center gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void run("add", async () => {
+                const added = await api<AlertRecipient>("/api/v1/alerts/recipients", token, { method: "POST", body: JSON.stringify(draft) });
+                setDraft({ name: "", channel: draft.channel, address: "", consent: false });
+                return `${added.name} will receive alerts on ${added.channel === "WHATSAPP" ? "WhatsApp" : "email"} (${added.address}).`;
+              });
+            }}
+          >
+            <input aria-label="Recipient name" placeholder="Name" required minLength={2} value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} className={`${field} w-36`} />
+            <select aria-label="Recipient channel" value={draft.channel} onChange={(e) => setDraft({ ...draft, channel: e.target.value as AlertRecipient["channel"] })} className={field}>
+              <option value="WHATSAPP">WhatsApp</option>
+              <option value="EMAIL">Email</option>
+            </select>
+            <input
+              aria-label="Recipient address"
+              required
+              placeholder={draft.channel === "WHATSAPP" ? "+923001234567" : "name@company.com"}
+              value={draft.address}
+              onChange={(e) => setDraft({ ...draft, address: e.target.value })}
+              className={`${field} w-48`}
+            />
+            <label className="flex items-center gap-1.5 text-slate-400">
+              <input type="checkbox" className={check} checked={draft.consent} onChange={(e) => setDraft({ ...draft, consent: e.target.checked })} aria-label="Recipient consent" />
+              They agreed to receive these alerts
+            </label>
+            <button type="submit" disabled={busy === "add" || !draft.consent} className="rounded-md border border-emerald-500/50 px-2.5 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50">
+              Add recipient
+            </button>
+          </form>
+        </div>
+
+        <div className="rounded-xl border border-ink-700 p-3" data-testid="alert-preview">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <p className="font-semibold uppercase tracking-wider text-slate-500">Next message preview</p>
+            <button
+              disabled={!!busy || recipients.every((r) => !r.active)}
+              onClick={() =>
+                void run("test", async () => {
+                  const results = await api<AlertTestResultRow[]>("/api/v1/alerts/test", token, { method: "POST", body: JSON.stringify({}) });
+                  return results
+                    .map((r) => (r.sent ? `Sent to ${r.name} (${r.channel === "WHATSAPP" ? "WhatsApp" : "email"} via ${r.provider})` : `Not sent to ${r.name}: ${r.error}`))
+                    .join(" · ");
+                })
+              }
+              className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/50 px-2.5 py-1 text-[11px] text-sky-300 hover:bg-sky-500/10 disabled:opacity-50"
+            >
+              {busy === "test" && <Spinner className="h-3 w-3" />} Send test now
+            </button>
+          </div>
+          {preview && preview.has_content ? (
+            <ul className="list-disc space-y-1 pl-4 text-slate-300">
+              {preview.lines.map((l) => (
+                <li key={l}>{l}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-slate-500">All clear: nothing needs attention right now.</p>
+          )}
+        </div>
+
+        {log.length > 0 && (
+          <div>
+            <p className="mb-2 font-semibold uppercase tracking-wider text-slate-500">Recent deliveries</p>
+            <ul className="space-y-1" aria-label="Alert deliveries">
+              {log.map((d) => (
+                <li key={d.delivery_id} className="flex flex-wrap items-center gap-2 text-slate-400">
+                  <Badge className={DELIVERY_TONE[d.status]}>{humanize(d.status)}</Badge>
+                  <span className="text-slate-200">{d.recipient_name ?? "Removed recipient"}</span>
+                  <span>
+                    {d.channel === "WHATSAPP" ? "WhatsApp" : "Email"} {d.address_masked}
+                  </span>
+                  <span>· {d.kind === "TEST" ? "test" : `digest ${d.period_key}`}</span>
+                  <span>· {timeAgo(d.created_at)}</span>
+                  {d.error && <span className="block w-full text-[11px] text-rose-300/80">{d.error}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 function ApprovalsInbox({
   token,
   currency,
@@ -2972,6 +3349,11 @@ export default function DashboardPage() {
             <div id="team" className="scroll-mt-6" />
             <TeamPanel token={session.token} myRole={session.role as Role} myUserId={myUserId} />
           </PanelBoundary>
+          {canEditPolicy && (
+            <PanelBoundary title="Alerts">
+              <AlertsPanel token={session.token} refreshKey={refreshKey} />
+            </PanelBoundary>
+          )}
         </div>
         <div className="xl:sticky xl:top-6 xl:self-start">
           <PanelBoundary title="Forensic chat">

@@ -15,12 +15,16 @@ case "$ROLE" in
     exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers "$WEB_CONCURRENCY" --proxy-headers
     ;;
   worker)
-    exec celery -A app.workers.tasks worker -Q default,ingest,reconcile \
+    # --beat runs the 15-minute alert scheduler inside this worker; run it in exactly one worker
+    # (CELERY_BEAT=false on extra replicas). Duplicate sends are prevented in the database anyway.
+    BEAT_FLAG=""
+    [ "${CELERY_BEAT:-true}" = "true" ] && BEAT_FLAG="--beat --schedule=/tmp/celerybeat-schedule"
+    exec celery -A app.workers.tasks worker -Q default,ingest,reconcile $BEAT_FLAG \
       --loglevel=INFO --concurrency="$CELERY_CONCURRENCY" --max-tasks-per-child=50
     ;;
   all)
     python -m app.database
-    celery -A app.workers.tasks worker -Q default,ingest,reconcile \
+    celery -A app.workers.tasks worker -Q default,ingest,reconcile --beat --schedule=/tmp/celerybeat-schedule \
       --loglevel=INFO --concurrency="$CELERY_CONCURRENCY" --max-tasks-per-child=50 &
     exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers 1 --proxy-headers
     ;;

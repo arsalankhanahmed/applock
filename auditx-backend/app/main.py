@@ -40,8 +40,11 @@ from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, ApprovalP
                                 JobOut, JobStatus, JobType, LoginRequest, ManualResolveRequest,
                                 ReconciliationRequest, RegisterRequest, TokenResponse, UserRole,
                                 ClaimableGroup, ClaimCreate, ClaimNote, ClaimOut, ClaimPage, ClaimPayment,
-                                ClaimStatus, ClaimSubmit, RecoverySummary)
-from app.services import ai_agent, approvals, mailer, recovery
+                                ClaimStatus, ClaimSubmit, RecoverySummary,
+                                AlertDeliveryOut, AlertPreview, AlertRecipientIn, AlertRecipientOut,
+                                AlertRecipientUpdate, AlertSettingsIn, AlertSettingsOut, AlertTestRequest,
+                                AlertTestResult)
+from app.services import ai_agent, alerts, approvals, mailer, recovery
 from app.workers.tasks import ingest_file, run_reconciliation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -217,6 +220,11 @@ async def approval_error_handler(_: Request, exc: approvals.ApprovalError) -> JS
 
 @app.exception_handler(recovery.RecoveryError)
 async def recovery_error_handler(_: Request, exc: recovery.RecoveryError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+
+@app.exception_handler(alerts.AlertError)
+async def alert_error_handler(_: Request, exc: alerts.AlertError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
@@ -734,6 +742,81 @@ async def write_off_claim(claim_id: UUID, body: ClaimNote, user: CurrentUser = D
 @app.post(f"{P}/claims/{{claim_id}}/cancel", response_model=ClaimOut, tags=["recovery"])
 async def cancel_claim(claim_id: UUID, user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
     return await run_in_threadpool(_in_tx, recovery.cancel_claim, user.org_id, claim_id, user.email)
+
+
+# ----------------------------------------------------------------------------- alerts (optional, per tenant)
+def _alert_settings(conn: Any, org_id: UUID) -> Dict[str, Any]:
+    return {**alerts.load_settings(conn, org_id), "channels": alerts.channel_status()}
+
+
+@app.get(f"{P}/alerts/settings", response_model=AlertSettingsOut, tags=["alerts"])
+async def get_alert_settings(user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    """The tenant's WhatsApp / email digest settings (off until switched on) and what this server can send."""
+    return await run_in_threadpool(_read, _alert_settings, user.org_id)
+
+
+@app.put(f"{P}/alerts/settings", response_model=AlertSettingsOut, tags=["alerts"])
+async def put_alert_settings(body: AlertSettingsIn, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    def save(conn: Any) -> Dict[str, Any]:
+        alerts.save_settings(conn, user.org_id, body.model_dump(mode="python"), user.email)
+        return _alert_settings(conn, user.org_id)
+
+    return await run_in_threadpool(_in_tx, save)
+
+
+@app.get(f"{P}/alerts/recipients", response_model=List[AlertRecipientOut], tags=["alerts"])
+async def list_alert_recipients(user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> List[Dict[str, Any]]:
+    return await run_in_threadpool(_read, alerts.list_recipients, user.org_id)
+
+
+@app.post(f"{P}/alerts/recipients", response_model=AlertRecipientOut, status_code=201, tags=["alerts"])
+async def add_alert_recipient(body: AlertRecipientIn, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    """Add a WhatsApp number (E.164) or email address. ``consent`` records that the person opted in."""
+    return await run_in_threadpool(
+        _in_tx, alerts.add_recipient, user.org_id, body.name, body.channel, body.address, body.consent, user.email)
+
+
+@app.patch(f"{P}/alerts/recipients/{{recipient_id}}", response_model=AlertRecipientOut, tags=["alerts"])
+async def update_alert_recipient(recipient_id: UUID, body: AlertRecipientUpdate,
+                                 user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    return await run_in_threadpool(_in_tx, alerts.update_recipient, user.org_id, recipient_id, body.active)
+
+
+@app.delete(f"{P}/alerts/recipients/{{recipient_id}}", status_code=204, response_class=Response, tags=["alerts"])
+async def delete_alert_recipient(recipient_id: UUID, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Response:
+    await run_in_threadpool(_in_tx, alerts.remove_recipient, user.org_id, recipient_id)
+    return Response(status_code=204)
+
+
+@app.get(f"{P}/alerts/preview", response_model=AlertPreview, tags=["alerts"])
+async def preview_alert(user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    """What the next digest would say right now, using the saved sections and minimum amount."""
+    return await run_in_threadpool(_read, alerts.preview, user.org_id)
+
+
+@app.post(f"{P}/alerts/test", response_model=List[AlertTestResult], tags=["alerts"])
+async def send_test_alert(body: AlertTestRequest = AlertTestRequest(),
+                          user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> List[Dict[str, Any]]:
+    """Send the current digest now to one recipient (or all active ones), even while alerts are switched off."""
+    return await run_in_threadpool(alerts.send_test, user.org_id, body.recipient_id)
+
+
+@app.get(f"{P}/alerts/deliveries", response_model=List[AlertDeliveryOut], tags=["alerts"])
+async def list_alert_deliveries(limit: int = Query(30, ge=1, le=200),
+                                user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> List[Dict[str, Any]]:
+    return await run_in_threadpool(_read, alerts.list_deliveries, user.org_id, limit)
+
+
+@app.post(f"{P}/internal/alerts/run-due", tags=["alerts"])
+async def run_due_alerts(request: Request) -> Dict[str, int]:
+    """For hosts without a Celery beat: call from a cron job with header ``X-Cron-Token: $ALERTS_CRON_TOKEN``."""
+    token = settings.ALERTS_CRON_TOKEN
+    supplied = request.headers.get("x-cron-token", "")
+    if not token:
+        raise HTTPException(404, "Not found")
+    if not hmac.compare_digest(supplied.encode(), token.encode()):
+        raise HTTPException(403, "Invalid cron token")
+    return await run_in_threadpool(alerts.run_due)
 
 
 # ----------------------------------------------------------------------------- team members

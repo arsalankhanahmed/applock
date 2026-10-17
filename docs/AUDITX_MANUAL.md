@@ -132,6 +132,13 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | POST | `/claims/{claim_id}/submit` | Mark as sent; `{"send_email": true, "counterparty_contact": "..."}` emails the letter |
 | POST | `/claims/{claim_id}/payments` | `{"amount", "reference", "received_on"}`; refused above the outstanding balance |
 | POST | `/claims/{claim_id}/reject` / `write-off` / `cancel` | Counterparty refused (needs `note`) / stop chasing the balance (needs `note`) / drop a draft |
+| GET / PUT | `/alerts/settings` | Optional WhatsApp / email digest settings (off by default) and what the server can send (OWNER / ADMIN) |
+| GET / POST | `/alerts/recipients` | List / add a recipient: `name`, `channel` (`WHATSAPP` or `EMAIL`), `address` (E.164 phone or email), `consent: true` (OWNER / ADMIN) |
+| PATCH / DELETE | `/alerts/recipients/{recipient_id}` | Pause / resume (`active`) or remove a recipient |
+| GET | `/alerts/preview` | What the next digest would say (any role) |
+| POST | `/alerts/test` | Send the digest now to all active recipients, or one `recipient_id`; works while alerts are off |
+| GET | `/alerts/deliveries` | Recent sends with status and error; addresses are masked |
+| POST | `/internal/alerts/run-due` | Cron hook for hosts without a Celery worker; header `X-Cron-Token: $ALERTS_CRON_TOKEN` (404 when unset) |
 | POST | `/agent/query` | `{"question": "..."}` → SQL, rows, narrative |
 
 ## 4. Bank and COD reconciliation
@@ -300,6 +307,59 @@ questions such as *"How much have we recovered from couriers?"* from the claim t
 like every other table.
 
 Roles: OWNER, ADMIN and ANALYST run claims. AUDITOR and VIEWER can see them but not create or change them.
+
+### 4.8 WhatsApp alerts (optional, per client)
+
+A short digest of what needs attention, sent on WhatsApp or by email every day or every Monday. It is
+**off for every company** until its OWNER or ADMIN switches it on (*WhatsApp Alerts* panel), so it can be offered
+on request or as a paid add-on.
+
+The digest has four sections, each of which can be switched off:
+* **COD stuck with couriers:** each courier holding cash for orders delivered more than *N* days ago (default 7).
+  For example: *"TCS holds PKR 230,000 COD for 41 orders, oldest delivered 18 days ago"*.
+* **Payouts not in the bank:** settlements never deposited, or deposited short.
+* **Fixes waiting for a checker:** number of fixes, their value, and the age of the oldest.
+* **Claims & recovery:** claims past their due date, money still claimable, and money recovered this month.
+
+**Settings:**
+* daily or weekly, the send hour and the time zone (default `Asia/Karachi`);
+* a minimum amount, so small items don't create noise;
+* whether to send an *"all clear"* message on quiet days.
+
+**Recipients:** WhatsApp numbers in international format (`+923001234567`; `0092…` and spaces are accepted) or
+email addresses. Adding one requires ticking *"They agreed to receive these alerts"*, because WhatsApp requires
+opt-in. The time of consent is stored. Recipients can be paused or removed.
+
+**Send test now** sends the current digest to the active recipients, even while alerts are off, and every send
+appears in *Recent deliveries*. The delivery log stores masked addresses only, and the forensic agent cannot read
+any alert table.
+
+**Server setup** (once, by whoever hosts AuditX):
+
+| `WHATSAPP_PROVIDER` | What you need |
+|---|---|
+| `meta` | A WhatsApp Business account on Meta's Cloud API: `WHATSAPP_META_TOKEN` (permanent system-user token), `WHATSAPP_META_PHONE_NUMBER_ID`, and an **approved message template** named `WHATSAPP_TEMPLATE_NAME` (default `auditx_daily_alert`) with three body parameters, e.g. *"AuditX alert for {{1}}: {{2}}. Details: {{3}}"* |
+| `twilio` | `WHATSAPP_TWILIO_ACCOUNT_SID`, `WHATSAPP_TWILIO_AUTH_TOKEN`, `WHATSAPP_TWILIO_FROM` (your WhatsApp sender, e.g. the sandbox `+14155238886`), and for production a Content template `WHATSAPP_TWILIO_CONTENT_SID` with the same three variables |
+| `log` | Nothing: messages go to the server log and the delivery log only. Use this for demos and testing |
+| *(empty)* | WhatsApp is off on this server; the panel says so. Email alerts work wherever SMTP is set |
+
+WhatsApp only delivers business-initiated messages through approved templates. Template parameters cannot
+contain line breaks, so AuditX sends the digest as one line with ` | ` between items. Conversation-based pricing
+applies on both providers, so check the current rates for your country.
+
+**Scheduling:**
+* With a worker, the Celery worker runs a scheduler (`celery … --beat`, enabled by `start.sh`) that checks every
+  15 minutes. Run the scheduler in one worker only: set `CELERY_BEAT=false` on any extra replicas.
+* On the free single-container plan there is no worker. Set `ALERTS_CRON_TOKEN` and have any cron service (for
+  example a scheduled GitHub Actions workflow, or cron-job.org) call:
+
+  ```bash
+  curl -X POST -H "X-Cron-Token: $ALERTS_CRON_TOKEN" https://<your-api>/api/v1/internal/alerts/run-due
+  ```
+  every 15–30 minutes.
+
+Each recipient gets at most one digest per day or week, however often the job runs. A failed send is retried on
+later runs, up to `ALERTS_MAX_ATTEMPTS` (default 3).
 
 ## 5. Security model of the Forensic Agent
 

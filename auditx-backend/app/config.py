@@ -44,6 +44,30 @@ class Settings(BaseSettings):
     SMTP_TIMEOUT_SECONDS: float = 10.0
     INVITE_EXPIRY_DAYS: int = 7
 
+    # WhatsApp alerts. Server-wide credentials; each tenant opts in from Alerts settings (off by default).
+    #   WHATSAPP_PROVIDER = ""      not configured: WhatsApp alerts cannot be sent (email alerts still can)
+    #                     = "meta"  WhatsApp Business Cloud API (needs an approved message template)
+    #                     = "twilio" Twilio WhatsApp (Content template SID, or a plain body in the sandbox)
+    #                     = "log"   development: messages are written to the log and the delivery log only
+    WHATSAPP_PROVIDER: str = ""
+    WHATSAPP_TIMEOUT_SECONDS: float = 15.0
+    # Meta Cloud API: template body must take three parameters: {{1}} company, {{2}} summary, {{3}} link.
+    WHATSAPP_META_TOKEN: str = ""
+    WHATSAPP_META_PHONE_NUMBER_ID: str = ""
+    WHATSAPP_META_API_VERSION: str = "v21.0"
+    WHATSAPP_TEMPLATE_NAME: str = "auditx_daily_alert"
+    WHATSAPP_TEMPLATE_LANGUAGE: str = "en"
+    # Twilio: WHATSAPP_TWILIO_FROM is the sender number in E.164 (e.g. +14155238886 for the sandbox).
+    WHATSAPP_TWILIO_ACCOUNT_SID: str = ""
+    WHATSAPP_TWILIO_AUTH_TOKEN: str = ""
+    WHATSAPP_TWILIO_FROM: str = ""
+    WHATSAPP_TWILIO_CONTENT_SID: str = ""
+    # Shared secret for POST /api/v1/internal/alerts/run-due, for hosts without a Celery beat (cron jobs).
+    # Empty disables the endpoint.
+    ALERTS_CRON_TOKEN: str = ""
+    # Failed sends are retried on later runs, up to this many attempts per recipient per period.
+    ALERTS_MAX_ATTEMPTS: int = 3
+
     UPLOAD_DIR: str = "/data/uploads"
     MAX_UPLOAD_MB: int = 2048
     UPLOAD_STREAM_BLOCK_BYTES: int = 1024 * 1024

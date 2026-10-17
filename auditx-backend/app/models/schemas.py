@@ -2,7 +2,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -567,3 +567,92 @@ class RecoverySummary(BaseModel):
     written_off_total: Decimal
     recovery_rate_pct: Optional[Decimal]
     by_counterparty: List[CounterpartyRecovery]
+
+
+# ---------------------------------------------------------------- alerts (WhatsApp / email digest)
+class AlertSettingsIn(BaseModel):
+    enabled: bool = False
+    frequency: Literal["DAILY", "WEEKLY"] = "DAILY"
+    send_hour: int = Field(default=9, ge=0, le=23)
+    timezone: str = Field(default="Asia/Karachi", min_length=1, max_length=64)
+    min_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    cod_overdue_days: int = Field(default=7, ge=1, le=90)
+    include_cod: bool = True
+    include_settlements: bool = True
+    include_approvals: bool = True
+    include_recovery: bool = True
+    send_when_clear: bool = False
+
+
+class AlertChannels(BaseModel):
+    whatsapp_provider: Optional[str]
+    whatsapp_ready: bool
+    whatsapp_problem: Optional[str]
+    email_ready: bool
+    scheduler: str
+
+
+class AlertSettingsOut(AlertSettingsIn):
+    updated_at: Optional[datetime] = None
+    updated_by_email: Optional[str] = None
+    channels: AlertChannels
+
+
+class AlertRecipientIn(BaseModel):
+    name: str = Field(min_length=2, max_length=255)
+    channel: Literal["WHATSAPP", "EMAIL"]
+    address: str = Field(min_length=3, max_length=320)
+    consent: bool = False
+
+
+class AlertRecipientUpdate(BaseModel):
+    active: bool
+
+
+class AlertRecipientOut(BaseModel):
+    recipient_id: UUID
+    name: str
+    channel: str
+    address: str
+    active: bool
+    consent_at: datetime
+    created_by_email: Optional[str]
+    created_at: datetime
+
+
+class AlertPreview(BaseModel):
+    lines: List[str]
+    text: str
+    whatsapp_summary: str
+    has_content: bool
+    next_period: Optional[str]
+
+
+class AlertTestRequest(BaseModel):
+    recipient_id: Optional[UUID] = None
+
+
+class AlertTestResult(BaseModel):
+    recipient_id: UUID
+    name: str
+    channel: str
+    address_masked: str
+    sent: bool
+    provider: Optional[str]
+    error: Optional[str]
+
+
+class AlertDeliveryOut(BaseModel):
+    delivery_id: UUID
+    recipient_name: Optional[str]
+    channel: str
+    address_masked: str
+    kind: str
+    period_key: str
+    status: str
+    provider: Optional[str]
+    provider_message_id: Optional[str]
+    error: Optional[str]
+    summary: Optional[str]
+    created_at: datetime
+    finished_at: Optional[datetime]
