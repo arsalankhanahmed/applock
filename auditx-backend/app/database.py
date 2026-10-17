@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS ix_users_org ON users (org_id);
 
 CREATE TABLE IF NOT EXISTS data_dictionary_master (
     standard_field_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    core_table_name      VARCHAR(64)  NOT NULL CHECK (core_table_name IN ('ecom_orders', 'gateway_transactions')),
+    core_table_name      VARCHAR(64)  NOT NULL,
     standard_field_name  VARCHAR(64)  NOT NULL,
     expected_data_type   VARCHAR(20)  NOT NULL CHECK (expected_data_type IN ('STRING', 'DECIMAL', 'TIMESTAMP', 'CURRENCY_CODE')),
     is_required          BOOLEAN      NOT NULL DEFAULT FALSE,
@@ -91,8 +91,7 @@ CREATE TABLE IF NOT EXISTS discrepancy_logs (
     log_id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     org_id                  UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
     source_order_number     VARCHAR(128) NOT NULL,
-    issue_type              VARCHAR(32) NOT NULL
-                            CHECK (issue_type IN ('MISSING_PAYMENT', 'UNTRACKED_REVENUE', 'AMOUNT_MISMATCH')),
+    issue_type              VARCHAR(32) NOT NULL,
     order_amount            NUMERIC(18, 2),
     gateway_amount          NUMERIC(18, 2),
     variance_amount         NUMERIC(18, 2) NOT NULL,
@@ -111,7 +110,7 @@ CREATE INDEX IF NOT EXISTS ix_discrepancy_org_order ON discrepancy_logs (org_id,
 CREATE TABLE IF NOT EXISTS audit_jobs (
     job_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     org_id       UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
-    job_type     VARCHAR(32) NOT NULL CHECK (job_type IN ('INGEST_ORDERS', 'INGEST_GATEWAY', 'RECONCILIATION')),
+    job_type     VARCHAR(32) NOT NULL,
     status       VARCHAR(16) NOT NULL DEFAULT 'QUEUED' CHECK (status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED')),
     payload      JSONB NOT NULL DEFAULT '{}'::jsonb,
     result       JSONB,
@@ -121,6 +120,68 @@ CREATE TABLE IF NOT EXISTS audit_jobs (
     finished_at  TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS ix_audit_jobs_org ON audit_jobs (org_id, created_at DESC);
+
+-- Bank statement lines (credits positive, debits negative).
+CREATE TABLE IF NOT EXISTS bank_transactions (
+    bank_txn_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id            UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    bank_account      VARCHAR(64) NOT NULL DEFAULT 'PRIMARY',
+    transaction_date  TIMESTAMPTZ NOT NULL,
+    description       TEXT NOT NULL DEFAULT '',
+    amount            NUMERIC(18, 2) NOT NULL,
+    bank_reference    VARCHAR(128) NOT NULL,
+    CONSTRAINT uq_bank_ref_per_org UNIQUE (org_id, bank_reference)
+);
+CREATE INDEX IF NOT EXISTS ix_bank_org_date ON bank_transactions (org_id, transaction_date);
+
+-- Courier / COD parcel reports (TCS, Leopards, PostEx, Trax ...). Re-uploads update a parcel's latest state.
+CREATE TABLE IF NOT EXISTS courier_remittances (
+    parcel_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id                UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    tracking_number       VARCHAR(128) NOT NULL,
+    source_order_number   VARCHAR(128) NOT NULL,
+    courier_name          VARCHAR(64) NOT NULL DEFAULT 'UNKNOWN',
+    parcel_status         VARCHAR(16) NOT NULL
+                          CHECK (parcel_status IN ('IN_TRANSIT', 'DELIVERED', 'RETURNED', 'LOST')),
+    cod_amount            NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    delivery_charges      NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    net_remitted          NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    remittance_reference  VARCHAR(128),
+    booked_at             TIMESTAMPTZ,
+    delivered_at          TIMESTAMPTZ,
+    remitted_at           TIMESTAMPTZ,
+    CONSTRAINT uq_parcel_per_org UNIQUE (org_id, tracking_number)
+);
+CREATE INDEX IF NOT EXISTS ix_courier_org_order ON courier_remittances (org_id, source_order_number);
+CREATE INDEX IF NOT EXISTS ix_courier_org_remittance ON courier_remittances (org_id, remittance_reference);
+
+-- Additive evolution of earlier tables (safe to re-run).
+ALTER TABLE ecom_orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(8) NOT NULL DEFAULT 'PREPAID'
+    CHECK (payment_method IN ('PREPAID', 'COD'));
+ALTER TABLE gateway_transactions ADD COLUMN IF NOT EXISTS payout_reference VARCHAR(128);
+CREATE INDEX IF NOT EXISTS ix_gateway_org_payout ON gateway_transactions (org_id, payout_reference);
+ALTER TABLE discrepancy_logs ADD COLUMN IF NOT EXISTS channel VARCHAR(16) NOT NULL DEFAULT 'GATEWAY'
+    CHECK (channel IN ('GATEWAY', 'BANK', 'COD'));
+CREATE INDEX IF NOT EXISTS ix_discrepancy_org_channel ON discrepancy_logs (org_id, channel, status);
+
+-- Enumerations live in named constraints so new values can be added by re-running this migration.
+ALTER TABLE data_dictionary_master DROP CONSTRAINT IF EXISTS data_dictionary_master_core_table_name_check;
+ALTER TABLE data_dictionary_master DROP CONSTRAINT IF EXISTS ck_dictionary_core_table;
+ALTER TABLE data_dictionary_master ADD CONSTRAINT ck_dictionary_core_table CHECK (core_table_name IN
+    ('ecom_orders', 'gateway_transactions', 'bank_transactions', 'courier_remittances'));
+
+ALTER TABLE discrepancy_logs DROP CONSTRAINT IF EXISTS discrepancy_logs_issue_type_check;
+ALTER TABLE discrepancy_logs DROP CONSTRAINT IF EXISTS ck_discrepancy_issue_type;
+ALTER TABLE discrepancy_logs ADD CONSTRAINT ck_discrepancy_issue_type CHECK (issue_type IN (
+    'MISSING_PAYMENT', 'UNTRACKED_REVENUE', 'AMOUNT_MISMATCH',
+    'SETTLEMENT_NOT_DEPOSITED', 'DEPOSIT_MISMATCH', 'UNMATCHED_DEPOSIT',
+    'COD_PARCEL_UNTRACKED', 'COD_ORDER_NOT_BOOKED', 'COD_NOT_REMITTED', 'COD_REMITTANCE_SHORTFALL',
+    'COURIER_OVERCHARGE', 'RETURNED_ORDER_BOOKED', 'PARCEL_LOST_OR_STUCK'));
+
+ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS audit_jobs_job_type_check;
+ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS ck_audit_job_type;
+ALTER TABLE audit_jobs ADD CONSTRAINT ck_audit_job_type CHECK (job_type IN
+    ('INGEST_ORDERS', 'INGEST_GATEWAY', 'INGEST_BANK', 'INGEST_COURIER', 'RECONCILIATION'));
 """
 
 # Core canonical schema every client ERP / gateway export is mapped onto.
@@ -133,6 +194,8 @@ DATA_DICTIONARY_SEED = [
      "ISO-4217 currency code of the order. Defaults to the organisation brand currency."),
     ("ecom_orders", "ordered_at", "TIMESTAMP", False,
      "Timestamp the order was placed in the storefront / ERP."),
+    ("ecom_orders", "payment_method", "STRING", False,
+     "PREPAID or COD. Values containing 'cod' or 'cash' are read as COD; blank defaults to PREPAID."),
     ("gateway_transactions", "source_order_number", "STRING", True,
      "Order reference propagated to the payment gateway (metadata / merchant reference)."),
     ("gateway_transactions", "source_transaction_id", "STRING", True,
@@ -145,6 +208,44 @@ DATA_DICTIONARY_SEED = [
      "Gateway processing fee. Derived as gross - net when absent."),
     ("gateway_transactions", "processed_at", "TIMESTAMP", False,
      "Timestamp the gateway captured / settled the transaction."),
+    ("gateway_transactions", "payout_reference", "STRING", False,
+     "Payout / settlement batch id the capture was paid out in. Matched against bank statement credits."),
+    ("bank_transactions", "transaction_date", "TIMESTAMP", True,
+     "Value / posting date of the statement line."),
+    ("bank_transactions", "description", "STRING", False,
+     "Narration. Payout and remittance references are read from it."),
+    ("bank_transactions", "amount", "DECIMAL", False,
+     "Signed amount (credit positive). Derived from credit_amount - debit_amount when absent."),
+    ("bank_transactions", "credit_amount", "DECIMAL", False,
+     "Credit column for statements with separate debit / credit columns."),
+    ("bank_transactions", "debit_amount", "DECIMAL", False,
+     "Debit column for statements with separate debit / credit columns."),
+    ("bank_transactions", "bank_reference", "STRING", False,
+     "Bank's unique line reference. A stable fingerprint is generated when absent."),
+    ("bank_transactions", "bank_account", "STRING", False,
+     "Account name or number, for organisations reconciling several accounts."),
+    ("courier_remittances", "tracking_number", "STRING", True,
+     "Courier consignment / tracking number (unique per parcel)."),
+    ("courier_remittances", "source_order_number", "STRING", True,
+     "Merchant order reference printed on the parcel."),
+    ("courier_remittances", "courier_name", "STRING", False,
+     "Courier company, e.g. TCS, Leopards, PostEx, Trax."),
+    ("courier_remittances", "parcel_status", "STRING", True,
+     "Delivered / Returned / Lost / In transit (courier wording is normalised)."),
+    ("courier_remittances", "cod_amount", "DECIMAL", False,
+     "Cash collected from the customer by the rider."),
+    ("courier_remittances", "delivery_charges", "DECIMAL", False,
+     "Courier charges deducted from the COD amount."),
+    ("courier_remittances", "net_remitted", "DECIMAL", False,
+     "Amount paid to the merchant for the parcel. Derived as cod - charges when a remittance reference exists."),
+    ("courier_remittances", "remittance_reference", "STRING", False,
+     "Remittance / payment batch number (CPR). Matched against bank statement credits."),
+    ("courier_remittances", "booked_at", "TIMESTAMP", False,
+     "Date the parcel was booked with the courier."),
+    ("courier_remittances", "delivered_at", "TIMESTAMP", False,
+     "Date the parcel was delivered or returned."),
+    ("courier_remittances", "remitted_at", "TIMESTAMP", False,
+     "Date the courier paid the remittance."),
 ]
 
 

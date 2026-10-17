@@ -1,14 +1,16 @@
 """Universal Data Dictionary file parser.
 
-Streams arbitrarily large ERP / gateway CSV exports (SAP, Dynamics 365, Shopify, Stripe, custom ERPs)
-chunk-by-chunk, maps tenant-specific headers onto the AuditX canonical schema using
+Streams arbitrarily large ERP, gateway, bank statement and courier COD exports (SAP, Dynamics 365,
+Shopify, Stripe, bank CSVs, TCS / Leopards / PostEx reports) chunk-by-chunk, maps tenant-specific headers onto the AuditX canonical schema using
 `client_field_mappings`, sanitises currency / date fields and bulk loads the result through
-PostgreSQL COPY into a staging table followed by an idempotent INSERT ... ON CONFLICT DO NOTHING.
+PostgreSQL COPY into a staging table followed by an idempotent merge: INSERT ... ON CONFLICT DO NOTHING,
+or, for courier reports whose parcels change state over time, an upsert where the latest file wins.
 Memory usage is bounded by PARSER_CHUNK_ROWS regardless of file size.
 """
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import logging
 import re
@@ -24,11 +26,11 @@ from app.database import engine
 
 logger = logging.getLogger("auditx.parser")
 
-SUPPORTED_TARGETS = ("ecom_orders", "gateway_transactions")
+SUPPORTED_TARGETS = ("ecom_orders", "gateway_transactions", "bank_transactions", "courier_remittances")
 
 # Ordered column layout written to COPY for each canonical table (org_id is prepended).
 TARGET_COLUMNS: Dict[str, List[str]] = {
-    "ecom_orders": ["source_order_number", "total_amount", "currency", "ordered_at"],
+    "ecom_orders": ["source_order_number", "total_amount", "currency", "ordered_at", "payment_method"],
     "gateway_transactions": [
         "source_order_number",
         "source_transaction_id",
@@ -36,29 +38,38 @@ TARGET_COLUMNS: Dict[str, List[str]] = {
         "net_amount",
         "fee_amount",
         "processed_at",
+        "payout_reference",
+    ],
+    "bank_transactions": ["bank_account", "transaction_date", "description", "amount", "bank_reference"],
+    "courier_remittances": [
+        "tracking_number",
+        "source_order_number",
+        "courier_name",
+        "parcel_status",
+        "cod_amount",
+        "delivery_charges",
+        "net_remitted",
+        "remittance_reference",
+        "booked_at",
+        "delivered_at",
+        "remitted_at",
     ],
 }
 
 CONFLICT_KEYS: Dict[str, str] = {
     "ecom_orders": "(org_id, source_order_number)",
     "gateway_transactions": "(org_id, source_transaction_id)",
+    "bank_transactions": "(org_id, bank_reference)",
+    "courier_remittances": "(org_id, tracking_number)",
 }
 
-STAGING_DDL: Dict[str, str] = {
-    "ecom_orders": """
-        CREATE TEMP TABLE stg_ecom_orders (
-            org_id UUID, source_order_number VARCHAR(128), total_amount NUMERIC(18,2),
-            currency VARCHAR(3), ordered_at TIMESTAMPTZ
-        ) ON COMMIT DROP
-    """,
-    "gateway_transactions": """
-        CREATE TEMP TABLE stg_gateway_transactions (
-            org_id UUID, source_order_number VARCHAR(128), source_transaction_id VARCHAR(128),
-            gross_amount NUMERIC(18,2), net_amount NUMERIC(18,2), fee_amount NUMERIC(18,2),
-            processed_at TIMESTAMPTZ
-        ) ON COMMIT DROP
-    """,
+# Fields that must be present after derivation, on top of the dictionary's is_required flags.
+DERIVED_REQUIRED: Dict[str, List[str]] = {
+    "bank_transactions": ["amount", "bank_reference"],
 }
+
+# Parcels change state between reports (in transit -> delivered -> remitted), so a re-upload updates them.
+UPSERT_TARGETS = {"courier_remittances": "tracking_number"}
 
 # --------------------------------------------------------------------------- regex sanitisers
 _CURRENCY_TOKENS = re.compile(
@@ -274,13 +285,51 @@ def _resolve_columns(header: List[str], rules: Dict[str, FieldRule]) -> Dict[str
 
 
 # --------------------------------------------------------------------------- chunk transformation
+def normalise_parcel_status(raw: pd.Series) -> pd.Series:
+    """Map courier wording ('Delivered', 'Returned to shipper', 'RTO', 'Out for delivery', 'Lost') to our states."""
+    s = raw.astype("string").str.lower().fillna("")
+    returned = s.str.contains(r"return|\brto\b|\brts\b|refused", regex=True)
+    lost = s.str.contains(r"lost|missing|damaged|stolen", regex=True)
+    delivered = s.str.contains("deliver") & ~s.str.contains(r"undeliver|out for|attempt", regex=True)
+    status = pd.Series("IN_TRANSIT", index=raw.index, dtype="object")
+    status[delivered] = "DELIVERED"
+    status[lost] = "LOST"
+    status[returned] = "RETURNED"
+    return status
+
+
+def _bank_fingerprints(out: pd.DataFrame, context: Dict[str, object]) -> pd.Series:
+    """Stable references for statement lines without one: identical lines are numbered by occurrence, so a
+    re-uploaded statement maps to the same keys and is skipped as duplicate."""
+    need = out["bank_reference"].isna()
+    if not need.any():
+        return out["bank_reference"]
+    amount_text = out["amount"].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
+    date_text = out["transaction_date"].dt.strftime("%Y-%m-%d").fillna("")
+    keys = (out["bank_account"].astype(str) + "|" + date_text + "|" + amount_text + "|"
+            + out["description"].astype(str))[need]
+    seen: Dict[str, int] = context.setdefault("fingerprints", {})  # type: ignore[assignment]
+    occurrence = keys.groupby(keys).cumcount() + keys.map(lambda k: seen.get(k, 0))
+    for key, count in keys.value_counts().items():
+        seen[key] = seen.get(key, 0) + int(count)
+    refs = out["bank_reference"].astype("object").copy()
+    refs[need] = [
+        "fp_" + hashlib.sha1(f"{key}|{occ}".encode()).hexdigest()[:24] for key, occ in zip(keys, occurrence)
+    ]
+    return refs
+
+
 def transform_chunk(
     chunk: pd.DataFrame,
     target_table: str,
     rules: Dict[str, FieldRule],
     default_currency: str,
+    context: Optional[Dict[str, object]] = None,
 ) -> tuple[pd.DataFrame, int]:
-    """Clean a renamed chunk into the canonical layout. Returns (clean_frame, rejected_row_count)."""
+    """Clean a renamed chunk into the canonical layout. Returns (clean_frame, rejected_row_count).
+
+    `context` carries state across chunks of one file (bank fingerprint occurrence counters)."""
+    context = {} if context is None else context
     out = pd.DataFrame(index=chunk.index)
     for standard_name, rule in rules.items():
         raw = chunk[standard_name] if standard_name in chunk.columns else pd.Series(pd.NA, index=chunk.index, dtype="string")
@@ -301,7 +350,29 @@ def transform_chunk(
         out["fee_amount"] = fee.fillna((gross - net).round(2)).fillna(0.0)
         out["net_amount"] = net.fillna((gross - out["fee_amount"]).round(2))
 
-    required = [name for name, rule in rules.items() if rule.is_required]
+    elif target_table == "ecom_orders":
+        method = out["payment_method"].astype("string").str.lower().fillna("")
+        is_cod = method.str.contains(r"\bcod\b|cash", regex=True)
+        out["payment_method"] = is_cod.map({True: "COD", False: "PREPAID"})
+
+    elif target_table == "bank_transactions":
+        derived = out["credit_amount"].abs().fillna(0) - out["debit_amount"].abs().fillna(0)
+        has_split = out["credit_amount"].notna() | out["debit_amount"].notna()
+        out["amount"] = out["amount"].fillna(derived.where(has_split)).round(2)
+        out["bank_account"] = out["bank_account"].fillna("PRIMARY")
+        out["description"] = out["description"].fillna("")
+        out["bank_reference"] = _bank_fingerprints(out, context)
+
+    elif target_table == "courier_remittances":
+        out["parcel_status"] = normalise_parcel_status(out["parcel_status"])
+        out["courier_name"] = out["courier_name"].str.upper().fillna("UNKNOWN")
+        out["cod_amount"] = out["cod_amount"].fillna(0.0)
+        out["delivery_charges"] = out["delivery_charges"].abs().fillna(0.0)
+        remitted = out["remittance_reference"].notna()
+        fallback = (out["cod_amount"] - out["delivery_charges"]).where(remitted, 0.0).round(2)
+        out["net_remitted"] = out["net_remitted"].fillna(fallback)
+
+    required = [name for name, rule in rules.items() if rule.is_required] + DERIVED_REQUIRED.get(target_table, [])
     valid_mask = out[required].notna().all(axis=1)
     rejected = int((~valid_mask).sum())
     clean = out.loc[valid_mask, TARGET_COLUMNS[target_table]]
@@ -322,8 +393,21 @@ def _frame_to_copy_buffer(frame: pd.DataFrame, org_id: UUID, target_table: str) 
     return buffer
 
 
+def _merge_sql(target_table: str, staging: str, columns: List[str]) -> str:
+    column_sql = ", ".join(columns)
+    upsert_key = UPSERT_TARGETS.get(target_table)
+    if upsert_key is None:
+        return (f"INSERT INTO {target_table} ({column_sql}) SELECT {column_sql} FROM {staging} "
+                f"ON CONFLICT {CONFLICT_KEYS[target_table]} DO NOTHING")
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c not in ("org_id", upsert_key))
+    # DISTINCT ON keeps the last row per key within the file: one statement may not update a row twice.
+    return (f"INSERT INTO {target_table} ({column_sql}) "
+            f"SELECT DISTINCT ON ({upsert_key}) {column_sql} FROM {staging} ORDER BY {upsert_key}, ctid DESC "
+            f"ON CONFLICT {CONFLICT_KEYS[target_table]} DO UPDATE SET {updates}")
+
+
 def bulk_load_chunk(frame: pd.DataFrame, org_id: UUID, target_table: str) -> int:
-    """COPY a cleaned chunk into a session-local staging table and merge idempotently. Returns rows inserted."""
+    """COPY a cleaned chunk into a session-local staging table and merge it. Returns rows written."""
     if frame.empty:
         return 0
     columns = ["org_id"] + TARGET_COLUMNS[target_table]
@@ -334,16 +418,12 @@ def bulk_load_chunk(frame: pd.DataFrame, org_id: UUID, target_table: str) -> int
     raw = engine.raw_connection()
     try:
         with raw.cursor() as cur:
-            cur.execute(STAGING_DDL[target_table])
+            cur.execute(f"CREATE TEMP TABLE {staging} (LIKE {target_table} INCLUDING DEFAULTS) ON COMMIT DROP")
             cur.copy_expert(f"COPY {staging} ({column_sql}) FROM STDIN WITH (FORMAT csv, NULL '')", buffer)
-            cur.execute(
-                f"INSERT INTO {target_table} ({column_sql}) "
-                f"SELECT {column_sql} FROM {staging} "
-                f"ON CONFLICT {CONFLICT_KEYS[target_table]} DO NOTHING"
-            )
-            inserted = cur.rowcount
+            cur.execute(_merge_sql(target_table, staging, columns))
+            written = cur.rowcount
         raw.commit()
-        return inserted
+        return written
     except Exception:
         raw.rollback()
         raise
@@ -390,6 +470,7 @@ def parse_stream(
     stream.seek(0)
     column_map = _resolve_columns(header, rules)
     report = ParseReport(target_table=target_table, column_map=column_map)
+    context: Dict[str, object] = {}
 
     reader = pd.read_csv(
         stream,
@@ -406,14 +487,14 @@ def parse_stream(
     )
     for chunk in reader:
         chunk = chunk.rename(columns=column_map)
-        clean, rejected = transform_chunk(chunk, target_table, rules, default_currency)
+        clean, rejected = transform_chunk(chunk, target_table, rules, default_currency, context)
         inserted = bulk_load_chunk(clean, org_id, target_table)
 
         report.chunks_processed += 1
         report.rows_read += len(chunk)
         report.rows_rejected += rejected
         report.rows_inserted += inserted
-        report.rows_duplicate += len(clean) - inserted
+        report.rows_duplicate += 0 if target_table in UPSERT_TARGETS else len(clean) - inserted
         logger.info(
             "org=%s table=%s chunk=%d read=%d inserted=%d rejected=%d",
             org_id, target_table, report.chunks_processed, len(chunk), inserted, rejected,

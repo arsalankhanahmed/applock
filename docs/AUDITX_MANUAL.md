@@ -1,7 +1,13 @@
 # AuditX — Deployment & Operations Manual
 
-AuditX is a multi-tenant B2B platform that reconciles ERP / storefront orders against payment-gateway
-captures, auto-heals known break patterns, and lets auditors interrogate the ledger in plain English.
+AuditX is a multi-tenant B2B platform that reconciles three money trails, auto-heals known break patterns,
+and lets auditors interrogate the ledger in plain English:
+
+| Leg | Compares | Catches |
+|-----|----------|---------|
+| **Gateway** | prepaid ERP / storefront orders ↔ payment-gateway captures | missing payments, untracked revenue, amount mismatches |
+| **Bank** | gateway payouts + courier COD remittances ↔ bank statement credits | payouts never banked, short deposits, unidentified credits |
+| **COD** | cash-on-delivery orders ↔ courier parcel reports (TCS, Leopards, PostEx, Trax, …) | cash not remitted, short remittance, rider short collection, courier overcharges, returns still booked as sales, lost / stuck parcels |
 
 | Layer     | Technology                                               | Location            |
 |-----------|----------------------------------------------------------|---------------------|
@@ -29,7 +35,9 @@ auditx-backend/
     ├── models/schemas.py      # Pydantic request / response schemas
     ├── services/
     │   ├── parser.py          # chunked universal CSV parser -> COPY bulk load
-    │   ├── reconciliation.py  # Pandas full outer join engine -> discrepancy_logs
+    │   ├── reconciliation.py  # orchestrator + gateway leg (Pandas full outer join) -> discrepancy_logs
+    │   ├── bank_reconciliation.py # bank leg: settlement batches <-> statement credits
+    │   ├── cod_reconciliation.py  # COD leg: COD orders <-> courier parcel reports
     │   ├── auto_healer.py     # AI Auto-Healer rule-book + JSONB fix proposals
     │   └── ai_agent.py        # Chat-with-your-Ledger SQL agent + guard + sandbox
     ├── workers/tasks.py       # Celery app + ingestion / reconciliation tasks
@@ -57,10 +65,15 @@ carries `org_id UUID NOT NULL REFERENCES organizations ON DELETE CASCADE`.
 | `users` | Tenant users (PBKDF2-SHA256 hashes) | `email UNIQUE`, role check (`OWNER/ADMIN/ANALYST/AUDITOR/VIEWER`) |
 | `data_dictionary_master` | Canonical fields every client file maps onto | `UNIQUE(core_table_name, standard_field_name)` |
 | `client_field_mappings` | Tenant header → canonical field (+ transformation rule) | `UNIQUE(org_id, standard_field_id)` |
-| `ecom_orders` | ERP / storefront orders | `UNIQUE(org_id, source_order_number)` |
-| `gateway_transactions` | Gateway captures | `UNIQUE(org_id, source_transaction_id)`, index `(org_id, source_order_number)` |
-| `discrepancy_logs` | Reconciliation findings + AI verdicts | `issue_type` / `status` checks, `resolved_at` required when resolved |
-| `audit_jobs` | Tenant-scoped background job ledger | `status` check |
+| `ecom_orders` | ERP / storefront orders, `payment_method` `PREPAID` or `COD` | `UNIQUE(org_id, source_order_number)` |
+| `gateway_transactions` | Gateway captures, with the `payout_reference` they were paid out in | `UNIQUE(org_id, source_transaction_id)`, indexes on order and payout |
+| `bank_transactions` | Bank statement lines (credit positive, debit negative) | `UNIQUE(org_id, bank_reference)`; a stable fingerprint is generated when the bank gives no reference |
+| `courier_remittances` | One row per COD parcel: status, cash collected, charges, net remitted, remittance (CPR) number | `UNIQUE(org_id, tracking_number)`; re-uploads **update** a parcel (latest report wins) |
+| `discrepancy_logs` | Findings + AI verdicts; `channel` = `GATEWAY` / `BANK` / `COD`; `order_amount` = expected, `gateway_amount` = received | `issue_type` / `channel` / `status` checks, `resolved_at` required when resolved |
+| `audit_jobs` | Tenant-scoped background job ledger | `job_type` / `status` checks |
+
+Enumerations (issue types, job types, dictionary tables) live in named check constraints that the migration
+drops and re-adds, so upgrading an existing database only needs `python -m app.database`.
 
 Migrations are idempotent (`CREATE ... IF NOT EXISTS`) and serialised with a PostgreSQL advisory lock, so
 several API replicas can boot at once. Run them explicitly with `python -m app.database`; the API also runs
@@ -94,15 +107,68 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | GET | `/me` | Current user + organisation |
 | GET | `/data-dictionary` | Canonical fields |
 | GET / PUT | `/mappings` | Read / upsert tenant header mappings (OWNER/ADMIN) |
-| POST | `/ingest/{ecom_orders\|gateway_transactions}` | Multipart upload, streamed to disk in 1 MB blocks → **202 Accepted** |
-| POST | `/reconciliation/run` | `{"auto_heal": true}` → **202 Accepted** |
+| POST | `/ingest/{ecom_orders\|gateway_transactions\|courier_remittances\|bank_transactions}` | Multipart upload, streamed to disk in 1 MB blocks → **202 Accepted** |
+| POST | `/reconciliation/run` | `{"auto_heal": true}` → **202 Accepted**; runs all three legs |
 | GET | `/jobs`, `/jobs/{job_id}` | Job status and result payloads |
-| GET | `/discrepancies` | Filters: `status`, `issue_type`, `auto_resolved`, `search`, `sort`, `limit`, `offset` |
+| GET | `/discrepancies` | Filters: `status`, `channel`, `issue_type`, `auto_resolved`, `search`, `sort`, `limit`, `offset` |
 | POST | `/discrepancies/{log_id}/resolve` | Manual resolution with audit note |
-| GET | `/dashboard/metrics` | KPI aggregates for the command center |
+| GET | `/dashboard/metrics` | KPIs, per-channel and per-issue exposure, root causes, per-courier COD ledger |
 | POST | `/agent/query` | `{"question": "..."}` → SQL, rows, narrative |
 
-## 4. Security model of the Forensic Agent
+## 4. Bank and COD reconciliation
+
+### 4.1 Bank leg
+
+Every **settlement batch** is expected to land in the bank as one credit:
+
+* a gateway payout = all captures sharing a `payout_reference` (expected amount = sum of `net_amount`);
+* a courier remittance = all parcels sharing a `remittance_reference` / CPR number (sum of `net_remitted`).
+
+Matching runs in two passes against statement credits: first by **reference** (the payout or CPR number
+appears in the narration or bank reference), then by **exact amount within `BANK_MATCH_WINDOW_DAYS`** of the
+batch closing, for banks that truncate narrations.
+
+| Finding | Meaning | Auto-Healer |
+|---------|---------|-------------|
+| `SETTLEMENT_NOT_DEPOSITED` | batch older than `SETTLEMENT_LAG_DAYS` (vs. the last statement date) with no credit | `GATEWAY_PAYOUT_NOT_RECEIVED` / `COURIER_REMITTANCE_NOT_RECEIVED`: request a payment trace |
+| `DEPOSIT_MISMATCH` | credit found, amount differs | under $0.50: `FX_ROUNDING_ERROR` (auto); ≤ 0.5% and ≤ $25: `BANK_CHARGES_DEDUCTED` (auto, journal to bank charges); else `UNEXPLAINED_SETTLEMENT_SHORTFALL` / `SETTLEMENT_OVER_DEPOSIT` |
+| `UNMATCHED_DEPOSIT` | a credit whose narration names a gateway or courier but matches no batch | `UNIDENTIFIED_SETTLEMENT_CREDIT`: allocate or park in suspense |
+
+Credits that don't look like settlements (loans, profit on deposit, capital) are ignored and counted in the
+report. Without a bank statement the leg is skipped, so nothing is flagged by mistake.
+
+### 4.2 COD leg
+
+Orders marked `COD` are taken out of the gateway leg and compared with the courier's parcel report instead.
+"Today" is the latest date in the tenant's own courier data, so results don't drift with the wall clock.
+
+| Finding | Meaning | Auto-Healer |
+|---------|---------|-------------|
+| `COD_PARCEL_UNTRACKED` | COD order older than `COD_DISPATCH_SLA_DAYS` that no courier has | `COD_ORDER_NOT_DISPATCHED` |
+| `COD_ORDER_NOT_BOOKED` | courier delivered and collected cash for an order the ERP doesn't have | `UNBOOKED_COD_SALE` + journal |
+| `COD_NOT_REMITTED` | delivered, no remittance after `COD_REMITTANCE_SLA_DAYS` | `COURIER_REMITTANCE_OVERDUE`: raise a claim |
+| `COD_REMITTANCE_SHORTFALL` | remitted less than order total minus charges | `RIDER_SHORT_COLLECTION` (cash collected < order) or `COURIER_UNEXPLAINED_DEDUCTION` |
+| `COURIER_OVERCHARGE` | charge above `COURIER_OVERCHARGE_RATIO` × that courier's median charge | `EXCESS_COURIER_CHARGES`: dispute the invoice |
+| `RETURNED_ORDER_BOOKED` | parcel returned but the ERP still carries the sale | `REVENUE_NOT_REVERSED_ON_RETURN` + sales-return journal |
+| `PARCEL_LOST_OR_STUCK` | courier reports lost, or in transit longer than `PARCEL_STUCK_DAYS` | `PARCEL_LOST_IN_TRANSIT` (loss claim) / `PARCEL_STUCK_IN_TRANSIT` |
+
+COD findings are never auto-resolved: each one is money to recover from a courier or a booking to change, so a
+person approves it.
+
+### 4.3 Uploading courier reports and bank statements
+
+* **Courier report** columns: tracking number, order reference, courier, status, COD amount, delivery charges,
+  net payable, CPR / remittance number, booking / delivery / payment dates. Courier wording such as
+  "Delivered", "Returned to Shipper", "RTO", "Out for delivery" or "Lost" is normalised automatically.
+  Upload the latest report whenever you like: parcels update in place.
+* **Bank statement** columns: value date, narration, and either one signed amount column or separate
+  Debit / Credit columns. A reference column is optional.
+
+Timing thresholds are environment settings: `SETTLEMENT_LAG_DAYS` (7), `BANK_MATCH_WINDOW_DAYS` (10),
+`COD_DISPATCH_SLA_DAYS` (7), `COD_REMITTANCE_SLA_DAYS` (10), `PARCEL_STUCK_DAYS` (21),
+`COURIER_OVERCHARGE_RATIO` (1.5).
+
+## 5. Security model of the Forensic Agent
 
 1. **Master prompt** locks the model to one read-only `SELECT` over a fixed schema and requires
    `org_id = :org_id` on every table reference.
@@ -117,15 +183,15 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
    `OR 1=1` that slips past the prompt only ever sees the caller's rows.
 4. Without `OPENAI_API_KEY`, a deterministic intent router generates the SQL. It goes through the same guard.
 
-## 5. Local sandbox launch (zero cost)
+## 6. Local sandbox launch (zero cost)
 
-### 5.1 Prerequisites
+### 6.1 Prerequisites
 
 * Docker Desktop (or Docker Engine + compose plugin)
 * Python 3.12+ (only for running outside Docker)
 * Node.js 18.17+ (20 LTS recommended)
 
-### 5.2 Option A: full stack in Docker (recommended)
+### 6.2 Option A: full stack in Docker (recommended)
 
 ```bash
 cd auditx-backend
@@ -137,7 +203,8 @@ curl http://localhost:8000/health
 # migrations run automatically on api start; to run them by hand:
 docker compose exec api python -m app.database
 
-# seed 20,000 orders with a 5% anomaly mix (+1% FX micro-variances) and reconcile
+# seed 20,000 orders (35% COD) with gateway, courier and bank data, planted anomalies on every leg
+# (+1% FX micro-variances), then reconcile
 docker compose exec api python -m app.utils.seeder --orders 20000 --fx-noise-rate 0.01 --reconcile
 
 # watch the Celery worker
@@ -146,7 +213,7 @@ docker compose logs -f worker
 
 The seeder prints `demo@auditx.io / AuditX#Demo2026`.
 
-### 5.3 Option B: Python virtualenv against Dockerised Postgres + Redis
+### 6.3 Option B: Python virtualenv against Dockerised Postgres + Redis
 
 ```bash
 cd auditx-backend
@@ -167,7 +234,7 @@ uvicorn app.main:app --reload --port 8000
 celery -A app.workers.tasks worker -Q default,ingest,reconcile --loglevel=INFO
 ```
 
-### 5.4 Frontend
+### 6.4 Frontend
 
 ```bash
 cd auditx-frontend
@@ -178,39 +245,47 @@ npm run dev                          # http://localhost:3000/dashboard
 npm run typecheck && npm run lint && npm run build && npm start
 ```
 
-### 5.5 Test the parser with dirty SAP / gateway exports
+### 6.5 Test the parser with dirty SAP / gateway / courier / bank exports
 
 ```bash
-# writes sap_sales_orders.csv + gateway_settlements.csv, creates a new empty org with SAP-style
-# header mappings, and an owner login for it
+# writes sap_sales_orders.csv, gateway_settlements.csv, courier_cod_report.csv and bank_statement.csv,
+# creates a new empty org with matching header mappings, and an owner login for it
 docker compose exec api python -m app.utils.seeder --orders 50000 --export-csv /data/uploads/samples \
   --export-only --company-name "Parser Pilot Co" --email parser@auditx.io --password 'Parser#Pilot2026'
 docker compose cp api:/data/uploads/samples ./samples
 ```
 
-Sign in as `parser@auditx.io`, then use **Upload ERP orders** / **Upload gateway file** in the dashboard
-and press **Run reconciliation + auto-heal**, or use the API:
+Sign in as `parser@auditx.io`, pick each file type in the upload menu, press **Upload file** for each of the
+four CSVs, then press **Run reconciliation + auto-heal**. Or use the API:
 
 ```bash
 TOKEN=$(curl -s -X POST localhost:8000/api/v1/auth/login -H 'content-type: application/json' \
   -d '{"email":"parser@auditx.io","password":"Parser#Pilot2026"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 curl -X POST localhost:8000/api/v1/ingest/ecom_orders -H "Authorization: Bearer $TOKEN" -F file=@samples/sap_sales_orders.csv
 curl -X POST localhost:8000/api/v1/ingest/gateway_transactions -H "Authorization: Bearer $TOKEN" -F file=@samples/gateway_settlements.csv
+curl -X POST localhost:8000/api/v1/ingest/courier_remittances -H "Authorization: Bearer $TOKEN" -F file=@samples/courier_cod_report.csv
+curl -X POST localhost:8000/api/v1/ingest/bank_transactions -H "Authorization: Bearer $TOKEN" -F file=@samples/bank_statement.csv
 curl -X POST localhost:8000/api/v1/reconciliation/run -H "Authorization: Bearer $TOKEN"
 curl localhost:8000/api/v1/jobs -H "Authorization: Bearer $TOKEN"
 ```
+
+The seeder prints how many anomalies it planted per leg; the reconciliation job result
+(`GET /jobs`) reports the findings per issue type, so you can check one against the other.
+
+Seeder knobs: `--cod-share` (0.35), `--cod-anomaly-rate` (0.05), `--return-rate` (0.06),
+`--bank-anomaly-rate` (0.05), `--anomaly-rate` (0.05, gateway), `--fx-noise-rate` (0).
 
 Large files: the upload is streamed to disk in `UPLOAD_STREAM_BLOCK_BYTES` blocks, and the worker parses it in
 `PARSER_CHUNK_ROWS` row chunks with a `COPY` per chunk, so memory stays flat for 500 MB+ exports.
 Raise `MAX_UPLOAD_MB` if you need bigger files.
 
-### 5.6 Reset
+### 6.6 Reset
 
 ```bash
 docker compose down -v               # removes pgdata, redisdata and uploads volumes
 ```
 
-## 6. Production free-tier roadmap (Vercel + Render + Neon)
+## 7. Production free-tier roadmap (Vercel + Render + Neon)
 
 > Free-tier limits change often. Check each provider's pricing page before launch. As of this writing:
 > Vercel **Hobby** is for personal, non-commercial use, so move to Pro once you bill customers. Render free web
@@ -218,7 +293,7 @@ docker compose down -v               # removes pgdata, redisdata and uploads vol
 > persistent disk and no free background workers. Neon free projects scale compute to zero when idle and
 > have a small storage quota (about 0.5 GB).
 
-### 6.1 Neon serverless PostgreSQL (database)
+### 7.1 Neon serverless PostgreSQL (database)
 
 1. Sign up at neon.tech → **Create project** (`auditx`, PostgreSQL 16, region closest to Render's region).
 2. **Dashboard → Connection details**: copy the *pooled* connection string, e.g.
@@ -234,7 +309,7 @@ python -m app.database
 python -m app.utils.seeder --orders 20000 --fx-noise-rate 0.01 --reconcile
 ```
 
-### 6.2 Render (FastAPI runtime)
+### 7.2 Render (FastAPI runtime)
 
 Two zero-cost topologies:
 
@@ -262,20 +337,20 @@ variables as `render.yaml`. Render injects `PORT`, and `start.sh` binds to it.
 Recommended free-tier tuning: `PARSER_CHUNK_ROWS=50000`, `MAX_UPLOAD_MB=200`, `AGENT_MAX_ROWS=500`.
 Uploaded files are deleted after parsing, so the ephemeral disk is enough.
 
-### 6.3 Vercel (Next.js web nodes)
+### 7.3 Vercel (Next.js web nodes)
 
 1. vercel.com → **Add New → Project** → import the repo.
 2. **Root Directory**: `auditx-frontend`. The framework preset is detected as Next.js.
 3. **Environment Variables**: `NEXT_PUBLIC_API_URL=https://auditx-api.onrender.com`.
 4. Deploy. Add the resulting `https://<project>.vercel.app` to Render's `CORS_ORIGINS` and redeploy the API.
 
-### 6.4 Keeping the MVP warm (optional, still free)
+### 7.4 Keeping the MVP warm (optional, still free)
 
 Render free services sleep when idle. Before demos, hit `/health` once. A free uptime monitor
 (for example UptimeRobot every 10 minutes) avoids cold starts, but it uses up the monthly free instance hours,
 so only enable it during pilot weeks.
 
-### 6.5 Graduation path
+### 7.5 Graduation path
 
 | Trigger | Upgrade |
 |---------|---------|
@@ -284,7 +359,7 @@ so only enable it during pilot weeks.
 | > 0.5 GB data | Neon Launch plan, or partition `ecom_orders` / `gateway_transactions` by `org_id` hash |
 | Enterprise / Big 4 | Dedicated DB per tenant, SSO (SAML/OIDC), customer-managed keys, SOC 2 controls |
 
-## 7. Production hardening checklist
+## 8. Production hardening checklist
 
 * Set a strong `JWT_SECRET` (`python -c "import secrets; print(secrets.token_urlsafe(64))"`).
 * Restrict `CORS_ORIGINS` to your exact frontend origin(s).

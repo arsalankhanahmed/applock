@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.config import settings
 from app.database import engine, init_db
-from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, CurrentUser, DashboardMetrics,
+from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, Channel, CurrentUser, DashboardMetrics,
                                 DataDictionaryField, DiscrepancyOut, DiscrepancyPage, DiscrepancyStatus,
                                 FieldMappingBulkIn, FieldMappingOut, IngestTarget, IssueType, JobAccepted,
                                 JobOut, JobStatus, JobType, LoginRequest, ManualResolveRequest,
@@ -301,6 +301,13 @@ async def upsert_mappings(body: FieldMappingBulkIn, user: CurrentUser = Depends(
 
 
 # ----------------------------------------------------------------------------- async jobs
+INGEST_JOB_TYPES = {
+    IngestTarget.ecom_orders: JobType.INGEST_ORDERS,
+    IngestTarget.gateway_transactions: JobType.INGEST_GATEWAY,
+    IngestTarget.bank_transactions: JobType.INGEST_BANK,
+    IngestTarget.courier_remittances: JobType.INGEST_COURIER,
+}
+
 @app.post(f"{P}/ingest/{{target}}", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED, tags=["jobs"])
 async def ingest(
     target: IngestTarget,
@@ -331,7 +338,7 @@ async def ingest(
         os.remove(path)
         raise HTTPException(422, "Uploaded file is empty")
 
-    job_type = JobType.INGEST_ORDERS if target == IngestTarget.ecom_orders else JobType.INGEST_GATEWAY
+    job_type = INGEST_JOB_TYPES[target]
     job_id = await run_in_threadpool(
         _create_job, user.org_id, job_type,
         {"filename": file.filename, "bytes": written, "target_table": target.value, "requested_by": user.email},
@@ -381,6 +388,7 @@ async def get_job(job_id: UUID, user: CurrentUser = Depends(current_user)) -> Di
 async def list_discrepancies(
     status_filter: Optional[DiscrepancyStatus] = Query(None, alias="status"),
     issue_type: Optional[IssueType] = None,
+    channel: Optional[Channel] = None,
     auto_resolved: Optional[bool] = None,
     search: Optional[str] = Query(None, max_length=128),
     sort: str = Query("variance", pattern="^(variance|recent)$"),
@@ -396,6 +404,9 @@ async def list_discrepancies(
     if issue_type:
         clauses.append("issue_type = :t")
         params["t"] = issue_type.value
+    if channel:
+        clauses.append("channel = :ch")
+        params["ch"] = channel.value
     if auto_resolved is not None:
         clauses.append("auto_resolved = :a")
         params["a"] = auto_resolved
@@ -453,8 +464,22 @@ WITH o AS (
 ), g AS (
     SELECT COUNT(*) AS n, COALESCE(SUM(gross_amount), 0) AS gross, COALESCE(SUM(fee_amount), 0) AS fees
       FROM gateway_transactions WHERE org_id = :o
+), b AS (
+    SELECT COALESCE(SUM(amount) FILTER (WHERE amount > 0), 0) AS credits
+      FROM bank_transactions WHERE org_id = :o
+), s AS (
+    SELECT (SELECT COALESCE(SUM(net_amount), 0) FROM gateway_transactions
+             WHERE org_id = :o AND payout_reference IS NOT NULL)
+         + (SELECT COALESCE(SUM(net_remitted), 0) FROM courier_remittances
+             WHERE org_id = :o AND remittance_reference IS NOT NULL) AS expected
+), c AS (
+    SELECT (SELECT COUNT(*) FROM ecom_orders WHERE org_id = :o AND payment_method = 'COD') AS cod_orders,
+           (SELECT COALESCE(SUM(cod_amount - delivery_charges), 0) FROM courier_remittances
+             WHERE org_id = :o AND parcel_status = 'DELIVERED' AND remittance_reference IS NULL) AS pending
 ), d AS (
     SELECT COUNT(*) FILTER (WHERE status = 'UNRESOLVED') AS open_n,
+           COALESCE(SUM(variance_amount) FILTER (WHERE status = 'UNRESOLVED'
+                    AND issue_type = 'SETTLEMENT_NOT_DEPOSITED'), 0) AS not_deposited,
            COALESCE(SUM(variance_amount) FILTER (WHERE status = 'UNRESOLVED' AND variance_amount > 0), 0) AS leakage,
            COUNT(*) FILTER (WHERE auto_resolved) AS healed_n,
            COALESCE(SUM(ABS(variance_amount)) FILTER (WHERE auto_resolved), 0) AS healed_v,
@@ -470,21 +495,67 @@ SELECT org.company_name, org.brand_currency,
        d.healed_n AS auto_healed_count, d.healed_v AS auto_healed_value, d.manual_n AS manual_resolved_count,
        CASE WHEN o.n = 0 THEN 0 ELSE ROUND(100.0 * (o.n - d.bad_orders) / o.n, 2) END AS match_rate_pct,
        CASE WHEN d.total_n = 0 THEN 0 ELSE ROUND(100.0 * d.healed_n / d.total_n, 2) END AS auto_heal_rate_pct,
+       b.credits AS bank_credits_total, s.expected AS settlements_expected_total,
+       d.not_deposited AS settlements_not_deposited, c.cod_orders, c.pending AS cod_pending_remittance,
        (SELECT MAX(finished_at) FROM audit_jobs
          WHERE org_id = :o AND job_type = 'RECONCILIATION' AND status = 'SUCCEEDED') AS last_reconciliation_at
-  FROM organizations org, o, g, d
+  FROM organizations org, o, g, b, s, c, d
  WHERE org.org_id = :o
 """
 
-_ISSUE_SQL = """
-SELECT t.issue_type,
+ISSUE_CHANNELS = {
+    "MISSING_PAYMENT": "GATEWAY", "UNTRACKED_REVENUE": "GATEWAY", "AMOUNT_MISMATCH": "GATEWAY",
+    "SETTLEMENT_NOT_DEPOSITED": "BANK", "DEPOSIT_MISMATCH": "BANK", "UNMATCHED_DEPOSIT": "BANK",
+    "COD_PARCEL_UNTRACKED": "COD", "COD_ORDER_NOT_BOOKED": "COD", "COD_NOT_REMITTED": "COD",
+    "COD_REMITTANCE_SHORTFALL": "COD", "COURIER_OVERCHARGE": "COD", "RETURNED_ORDER_BOOKED": "COD",
+    "PARCEL_LOST_OR_STUCK": "COD",
+}
+_ISSUE_VALUES = ", ".join(f"('{issue}', '{channel}', {i})" for i, (issue, channel) in enumerate(ISSUE_CHANNELS.items()))
+
+_ISSUE_SQL = f"""
+SELECT t.issue_type, t.channel,
        COUNT(l.log_id) FILTER (WHERE l.status = 'UNRESOLVED') AS open_count,
        COALESCE(SUM(ABS(l.variance_amount)) FILTER (WHERE l.status = 'UNRESOLVED'), 0) AS open_exposure,
        COUNT(l.log_id) FILTER (WHERE l.status = 'RESOLVED') AS resolved_count
-  FROM (VALUES ('MISSING_PAYMENT'), ('UNTRACKED_REVENUE'), ('AMOUNT_MISMATCH')) AS t(issue_type)
+  FROM (VALUES {_ISSUE_VALUES}) AS t(issue_type, channel, pos)
   LEFT JOIN discrepancy_logs l ON l.issue_type = t.issue_type AND l.org_id = :o
- GROUP BY t.issue_type
- ORDER BY t.issue_type
+ GROUP BY t.issue_type, t.channel, t.pos
+ ORDER BY t.pos
+"""
+
+_CHANNEL_SQL = """
+SELECT t.channel,
+       COUNT(l.log_id) FILTER (WHERE l.status = 'UNRESOLVED') AS open_count,
+       COALESCE(SUM(ABS(l.variance_amount)) FILTER (WHERE l.status = 'UNRESOLVED'), 0) AS open_exposure,
+       COUNT(l.log_id) FILTER (WHERE l.status = 'RESOLVED') AS resolved_count
+  FROM (VALUES ('GATEWAY', 1), ('BANK', 2), ('COD', 3)) AS t(channel, pos)
+  LEFT JOIN discrepancy_logs l ON l.channel = t.channel AND l.org_id = :o
+ GROUP BY t.channel, t.pos
+ ORDER BY t.pos
+"""
+
+_COURIER_SQL = """
+WITH as_of AS (
+    SELECT MAX(GREATEST(booked_at, delivered_at, remitted_at)) AS t FROM courier_remittances WHERE org_id = :o
+)
+SELECT courier_name,
+       COUNT(*) AS parcels,
+       COUNT(*) FILTER (WHERE parcel_status = 'DELIVERED') AS delivered,
+       COUNT(*) FILTER (WHERE parcel_status = 'RETURNED') AS returned,
+       COALESCE(SUM(cod_amount) FILTER (WHERE parcel_status = 'DELIVERED'), 0) AS cod_collected,
+       COALESCE(SUM(delivery_charges) FILTER (WHERE parcel_status = 'DELIVERED'), 0) AS charges,
+       COALESCE(SUM(net_remitted), 0) AS remitted,
+       COALESCE(SUM(cod_amount - delivery_charges)
+                FILTER (WHERE parcel_status = 'DELIVERED' AND remittance_reference IS NULL), 0) AS pending_remittance,
+       COALESCE(SUM(cod_amount - delivery_charges)
+                FILTER (WHERE parcel_status = 'DELIVERED' AND remittance_reference IS NULL
+                        AND delivered_at <= as_of.t - make_interval(days => :sla)), 0) AS overdue_remittance,
+       COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE parcel_status = 'RETURNED')
+                / NULLIF(COUNT(*) FILTER (WHERE parcel_status IN ('DELIVERED', 'RETURNED')), 0), 2), 0) AS return_rate_pct
+  FROM courier_remittances, as_of
+ WHERE org_id = :o
+ GROUP BY courier_name
+ ORDER BY pending_remittance DESC
 """
 
 _ROOT_CAUSE_SQL = """
@@ -506,8 +577,18 @@ async def dashboard_metrics(user: CurrentUser = Depends(current_user)) -> Dashbo
         with engine.connect() as conn:
             head = conn.execute(text(_METRICS_SQL), params).mappings().one()
             issues = conn.execute(text(_ISSUE_SQL), params).mappings().all()
+            channels = conn.execute(text(_CHANNEL_SQL), params).mappings().all()
             causes = conn.execute(text(_ROOT_CAUSE_SQL), params).mappings().all()
-        return DashboardMetrics(**head, by_issue_type=[dict(r) for r in issues], by_root_cause=[dict(r) for r in causes])
+            couriers = conn.execute(
+                text(_COURIER_SQL), {**params, "sla": settings.COD_REMITTANCE_SLA_DAYS}
+            ).mappings().all()
+        return DashboardMetrics(
+            **head,
+            by_channel=[dict(r) for r in channels],
+            by_issue_type=[dict(r) for r in issues],
+            by_root_cause=[dict(r) for r in causes],
+            courier_summary=[dict(r) for r in couriers],
+        )
 
     return await run_in_threadpool(collect)
 

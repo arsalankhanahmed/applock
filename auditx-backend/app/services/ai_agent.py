@@ -42,21 +42,47 @@ class UnsafeQueryError(ValueError):
 SCHEMA_CONTEXT = """
 TABLE ecom_orders (
   order_id UUID, org_id UUID, source_order_number VARCHAR, total_amount NUMERIC(18,2),
-  currency VARCHAR(3), ordered_at TIMESTAMPTZ
+  currency VARCHAR(3), ordered_at TIMESTAMPTZ, payment_method VARCHAR  -- 'PREPAID' or 'COD'
 )  -- one row per ERP / storefront order
 TABLE gateway_transactions (
   gateway_txn_id UUID, org_id UUID, source_order_number VARCHAR, source_transaction_id VARCHAR,
-  gross_amount NUMERIC(18,2), net_amount NUMERIC(18,2), fee_amount NUMERIC(18,2), processed_at TIMESTAMPTZ
+  gross_amount NUMERIC(18,2), net_amount NUMERIC(18,2), fee_amount NUMERIC(18,2), processed_at TIMESTAMPTZ,
+  payout_reference VARCHAR  -- payout batch the capture was settled to the bank in
 )  -- one row per payment-gateway capture; join to ecom_orders on source_order_number
+TABLE bank_transactions (
+  bank_txn_id UUID, org_id UUID, bank_account VARCHAR, transaction_date TIMESTAMPTZ, description TEXT,
+  amount NUMERIC(18,2)  -- credit positive, debit negative
+  , bank_reference VARCHAR
+)  -- bank statement lines
+TABLE courier_remittances (
+  parcel_id UUID, org_id UUID, tracking_number VARCHAR, source_order_number VARCHAR,
+  courier_name VARCHAR  -- e.g. TCS, LEOPARDS, POSTEX, TRAX
+  , parcel_status VARCHAR  -- 'IN_TRANSIT','DELIVERED','RETURNED','LOST'
+  , cod_amount NUMERIC  -- cash collected by the rider
+  , delivery_charges NUMERIC, net_remitted NUMERIC  -- paid to the merchant
+  , remittance_reference VARCHAR  -- NULL until the courier pays
+  , booked_at TIMESTAMPTZ, delivered_at TIMESTAMPTZ, remitted_at TIMESTAMPTZ
+)  -- one row per COD / courier parcel; join to ecom_orders on source_order_number
 TABLE discrepancy_logs (
-  log_id UUID, org_id UUID, source_order_number VARCHAR,
-  issue_type VARCHAR  -- one of 'MISSING_PAYMENT','UNTRACKED_REVENUE','AMOUNT_MISMATCH'
-  , order_amount NUMERIC, gateway_amount NUMERIC,
-  variance_amount NUMERIC  -- order_amount - gateway_amount; positive = revenue leakage
+  log_id UUID, org_id UUID,
+  source_order_number VARCHAR  -- order number; for channel 'BANK' the payout / remittance / bank reference
+  , channel VARCHAR  -- 'GATEWAY', 'BANK' or 'COD'
+  , issue_type VARCHAR  -- GATEWAY: 'MISSING_PAYMENT','UNTRACKED_REVENUE','AMOUNT_MISMATCH';
+                        -- BANK: 'SETTLEMENT_NOT_DEPOSITED','DEPOSIT_MISMATCH','UNMATCHED_DEPOSIT';
+                        -- COD: 'COD_PARCEL_UNTRACKED','COD_ORDER_NOT_BOOKED','COD_NOT_REMITTED',
+                        --      'COD_REMITTANCE_SHORTFALL','COURIER_OVERCHARGE','RETURNED_ORDER_BOOKED',
+                        --      'PARCEL_LOST_OR_STUCK'
+  , order_amount NUMERIC  -- expected amount
+  , gateway_amount NUMERIC  -- received amount
+  , variance_amount NUMERIC  -- expected - received; positive = revenue leakage
   , status VARCHAR  -- 'UNRESOLVED' or 'RESOLVED'
   , ai_root_cause_category VARCHAR  -- e.g. FX_ROUNDING_ERROR, PROMO_CODE_UNSYNCED, GATEWAY_FEE_NETTING,
                                     -- ORDER_ID_FORMAT_DRIFT, PAYMENT_NOT_CAPTURED, ORPHAN_GATEWAY_PAYMENT,
-                                    -- DUPLICATE_CAPTURE, POTENTIAL_FRAUD_OR_MANIPULATION, UNEXPLAINED_VARIANCE
+                                    -- DUPLICATE_CAPTURE, POTENTIAL_FRAUD_OR_MANIPULATION, UNEXPLAINED_VARIANCE,
+                                    -- BANK_CHARGES_DEDUCTED, GATEWAY_PAYOUT_NOT_RECEIVED,
+                                    -- COURIER_REMITTANCE_NOT_RECEIVED, COURIER_REMITTANCE_OVERDUE,
+                                    -- RIDER_SHORT_COLLECTION, EXCESS_COURIER_CHARGES,
+                                    -- REVENUE_NOT_REVERSED_ON_RETURN, PARCEL_LOST_IN_TRANSIT
   , ai_confidence_score NUMERIC, ai_suggested_fix JSONB, auto_resolved BOOLEAN,
   detected_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ
 )
@@ -124,6 +150,8 @@ TENANT_VIEWS = {
     "ecom_orders": "SELECT * FROM public.ecom_orders WHERE org_id = '{org}'",
     "gateway_transactions": "SELECT * FROM public.gateway_transactions WHERE org_id = '{org}'",
     "discrepancy_logs": "SELECT * FROM public.discrepancy_logs WHERE org_id = '{org}'",
+    "bank_transactions": "SELECT * FROM public.bank_transactions WHERE org_id = '{org}'",
+    "courier_remittances": "SELECT * FROM public.courier_remittances WHERE org_id = '{org}'",
     "users": "SELECT NULL::uuid AS user_id, NULL::uuid AS org_id WHERE FALSE",
     "client_field_mappings": "SELECT NULL::uuid AS mapping_id, NULL::uuid AS org_id WHERE FALSE",
     "audit_jobs": "SELECT NULL::uuid AS job_id, NULL::uuid AS org_id WHERE FALSE",
@@ -241,6 +269,25 @@ def _llm_narrative(question: str, sql: str, frame: pd.DataFrame) -> str:
 
 _INTENTS: List[Tuple[re.Pattern, str, str]] = [
     (
+        re.compile(r"(courier|cod\b|cash on delivery|remit|rider|tcs|leopards|postex|trax)", re.I),
+        "Cash owed by each courier: delivered COD not yet remitted, charges and returns.",
+        """SELECT c.courier_name, COUNT(*) FILTER (WHERE c.parcel_status = 'DELIVERED') AS delivered,
+                  ROUND(COALESCE(SUM(c.cod_amount - c.delivery_charges) FILTER (
+                        WHERE c.parcel_status = 'DELIVERED' AND c.remittance_reference IS NULL), 0), 2) AS pending_remittance,
+                  ROUND(COALESCE(SUM(c.delivery_charges) FILTER (WHERE c.parcel_status = 'DELIVERED'), 0), 2) AS charges,
+                  COUNT(*) FILTER (WHERE c.parcel_status = 'RETURNED') AS returned
+             FROM courier_remittances c WHERE c.org_id = :org_id
+            GROUP BY c.courier_name ORDER BY pending_remittance DESC LIMIT 50""",
+    ),
+    (
+        re.compile(r"(bank|deposit|payout|settle|statement)", re.I),
+        "Open bank-leg findings: settlements that never reached the bank, short deposits and unidentified credits.",
+        """SELECT d.source_order_number AS reference, d.issue_type, d.order_amount AS expected,
+                  d.gateway_amount AS received, d.variance_amount, d.ai_root_cause_category AS root_cause
+             FROM discrepancy_logs d WHERE d.org_id = :org_id AND d.channel = 'BANK' AND d.status = 'UNRESOLVED'
+            ORDER BY ABS(d.variance_amount) DESC LIMIT 100""",
+    ),
+    (
         re.compile(r"(root cause|categor|why|cause)", re.I),
         "Open and healed discrepancies grouped by AI root-cause category.",
         """SELECT d.ai_root_cause_category AS root_cause, d.status, COUNT(*) AS findings,
@@ -308,11 +355,11 @@ _INTENTS: List[Tuple[re.Pattern, str, str]] = [
 
 _DEFAULT_INTENT = (
     "Revenue leakage summary by issue type for open findings.",
-    """SELECT d.issue_type, COUNT(*) AS open_findings,
+    """SELECT d.channel, d.issue_type, COUNT(*) AS open_findings,
               ROUND(SUM(CASE WHEN d.variance_amount > 0 THEN d.variance_amount ELSE 0 END), 2) AS leakage,
               ROUND(SUM(CASE WHEN d.variance_amount < 0 THEN -d.variance_amount ELSE 0 END), 2) AS untracked_inflow
          FROM discrepancy_logs d WHERE d.org_id = :org_id AND d.status = 'UNRESOLVED'
-        GROUP BY d.issue_type ORDER BY leakage DESC LIMIT 10""",
+        GROUP BY d.channel, d.issue_type ORDER BY leakage DESC LIMIT 20""",
 )
 
 
@@ -327,7 +374,7 @@ def _heuristic_generate_sql(question: str) -> Tuple[str, str]:
 def _heuristic_narrative(frame: pd.DataFrame, explanation: str) -> str:
     if frame.empty:
         return f"{explanation} No matching records were found for your organisation."
-    preference = ["leakage", "exposure", "value_healed", "variance_amount", "gross", "fees",
+    preference = ["leakage", "pending_remittance", "exposure", "value_healed", "variance_amount", "gross", "fees",
                   "order_amount", "gateway_amount"]
     money_cols = [c for c in preference if c in frame.columns]
     summary = f"{explanation} Returned {len(frame)} row(s)."

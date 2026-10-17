@@ -16,10 +16,25 @@ import {
 /* ============================================================================
  * Types — mirror app/models/schemas.py
  * ========================================================================== */
-type IssueType = "MISSING_PAYMENT" | "UNTRACKED_REVENUE" | "AMOUNT_MISMATCH";
+type Channel = "GATEWAY" | "BANK" | "COD";
+type IssueType =
+  | "MISSING_PAYMENT"
+  | "UNTRACKED_REVENUE"
+  | "AMOUNT_MISMATCH"
+  | "SETTLEMENT_NOT_DEPOSITED"
+  | "DEPOSIT_MISMATCH"
+  | "UNMATCHED_DEPOSIT"
+  | "COD_PARCEL_UNTRACKED"
+  | "COD_ORDER_NOT_BOOKED"
+  | "COD_NOT_REMITTED"
+  | "COD_REMITTANCE_SHORTFALL"
+  | "COURIER_OVERCHARGE"
+  | "RETURNED_ORDER_BOOKED"
+  | "PARCEL_LOST_OR_STUCK";
+type IngestTarget = "ecom_orders" | "gateway_transactions" | "courier_remittances" | "bank_transactions";
 type DiscrepancyStatus = "UNRESOLVED" | "RESOLVED";
 type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
-type JobType = "INGEST_ORDERS" | "INGEST_GATEWAY" | "RECONCILIATION";
+type JobType = "INGEST_ORDERS" | "INGEST_GATEWAY" | "INGEST_BANK" | "INGEST_COURIER" | "RECONCILIATION";
 type Money = string | number;
 
 interface Session {
@@ -40,9 +55,30 @@ interface TokenResponse {
 
 interface IssueBreakdown {
   issue_type: IssueType;
+  channel: Channel;
   open_count: number;
   open_exposure: Money;
   resolved_count: number;
+}
+
+interface ChannelBreakdown {
+  channel: Channel;
+  open_count: number;
+  open_exposure: Money;
+  resolved_count: number;
+}
+
+interface CourierSummary {
+  courier_name: string;
+  parcels: number;
+  delivered: number;
+  returned: number;
+  cod_collected: Money;
+  charges: Money;
+  remitted: Money;
+  pending_remittance: Money;
+  overdue_remittance: Money;
+  return_rate_pct: Money;
 }
 
 interface RootCauseBreakdown {
@@ -67,8 +103,15 @@ interface DashboardMetrics {
   manual_resolved_count: number;
   match_rate_pct: Money;
   auto_heal_rate_pct: Money;
+  bank_credits_total: Money;
+  settlements_expected_total: Money;
+  settlements_not_deposited: Money;
+  cod_orders: number;
+  cod_pending_remittance: Money;
+  by_channel: ChannelBreakdown[];
   by_issue_type: IssueBreakdown[];
   by_root_cause: RootCauseBreakdown[];
+  courier_summary: CourierSummary[];
   last_reconciliation_at: string | null;
 }
 
@@ -100,7 +143,7 @@ interface SuggestedFix {
   match?: Record<string, unknown>;
   transform?: { field: string; from: unknown; to: unknown };
   journal?: JournalLine[];
-  evidence?: { events?: GatewayEvent[]; discount_codes_seen?: string[]; source?: string } | null;
+  evidence?: ({ events?: GatewayEvent[]; discount_codes_seen?: string[] } & Record<string, unknown>) | null;
   next_steps?: string[];
   manual_resolution?: { note: string; resolved_by: string; resolved_at: string };
   [key: string]: unknown;
@@ -110,6 +153,7 @@ interface Discrepancy {
   log_id: string;
   source_order_number: string;
   issue_type: IssueType;
+  channel: Channel;
   order_amount: Money | null;
   gateway_amount: Money | null;
   variance_amount: Money;
@@ -255,7 +299,12 @@ function money(v: Money | null | undefined, currency = "USD", compact = false): 
 
 const integer = (v: number): string => new Intl.NumberFormat("en-US").format(v);
 const pct = (v: Money): string => `${num(v).toFixed(2)}%`;
-const humanize = (s: string): string => s.toLowerCase().replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+const humanize = (s: string): string =>
+  s
+    .toLowerCase()
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .replace(/\b(Cod|Fx|Erp|Id)\b/g, (w) => w.toUpperCase());
 
 function timeAgo(iso: string | null): string {
   if (!iso) return "never";
@@ -273,11 +322,58 @@ function cell(value: unknown): string {
   return String(value);
 }
 
-const ISSUE_META: Record<IssueType, { label: string; tone: string; bar: string }> = {
-  MISSING_PAYMENT: { label: "Missing Payments", tone: "text-rose-300 bg-rose-500/10 ring-rose-500/30", bar: "bg-rose-500" },
-  UNTRACKED_REVENUE: { label: "Untracked Revenue", tone: "text-amber-300 bg-amber-500/10 ring-amber-500/30", bar: "bg-amber-400" },
-  AMOUNT_MISMATCH: { label: "Amount Mismatch", tone: "text-sky-300 bg-sky-500/10 ring-sky-500/30", bar: "bg-sky-400" },
+const TONE = {
+  rose: "text-rose-300 bg-rose-500/10 ring-rose-500/30",
+  amber: "text-amber-300 bg-amber-500/10 ring-amber-500/30",
+  sky: "text-sky-300 bg-sky-500/10 ring-sky-500/30",
+  violet: "text-violet-300 bg-violet-500/10 ring-violet-500/30",
+  orange: "text-orange-300 bg-orange-500/10 ring-orange-500/30",
 };
+
+const ISSUE_META: Record<IssueType, { label: string; tone: string }> = {
+  MISSING_PAYMENT: { label: "Missing Payment", tone: TONE.rose },
+  UNTRACKED_REVENUE: { label: "Untracked Revenue", tone: TONE.amber },
+  AMOUNT_MISMATCH: { label: "Amount Mismatch", tone: TONE.sky },
+  SETTLEMENT_NOT_DEPOSITED: { label: "Not Deposited", tone: TONE.rose },
+  DEPOSIT_MISMATCH: { label: "Deposit Mismatch", tone: TONE.violet },
+  UNMATCHED_DEPOSIT: { label: "Unidentified Credit", tone: TONE.amber },
+  COD_PARCEL_UNTRACKED: { label: "Never Dispatched", tone: TONE.amber },
+  COD_ORDER_NOT_BOOKED: { label: "Parcel Not in ERP", tone: TONE.amber },
+  COD_NOT_REMITTED: { label: "COD Not Remitted", tone: TONE.rose },
+  COD_REMITTANCE_SHORTFALL: { label: "Short Remittance", tone: TONE.orange },
+  COURIER_OVERCHARGE: { label: "Courier Overcharge", tone: TONE.orange },
+  RETURNED_ORDER_BOOKED: { label: "Return Still Booked", tone: TONE.violet },
+  PARCEL_LOST_OR_STUCK: { label: "Lost / Stuck Parcel", tone: TONE.rose },
+};
+
+const CHANNEL_META: Record<Channel, { label: string; bar: string; hint: string }> = {
+  GATEWAY: { label: "Orders ↔ Gateway", bar: "bg-sky-400", hint: "prepaid orders vs captures" },
+  BANK: { label: "Settlements ↔ Bank", bar: "bg-violet-400", hint: "payouts & remittances vs statement" },
+  COD: { label: "COD ↔ Couriers", bar: "bg-orange-400", hint: "cash on delivery vs courier reports" },
+};
+
+const ISSUE_CHANNEL: Record<IssueType, Channel> = {
+  MISSING_PAYMENT: "GATEWAY",
+  UNTRACKED_REVENUE: "GATEWAY",
+  AMOUNT_MISMATCH: "GATEWAY",
+  SETTLEMENT_NOT_DEPOSITED: "BANK",
+  DEPOSIT_MISMATCH: "BANK",
+  UNMATCHED_DEPOSIT: "BANK",
+  COD_PARCEL_UNTRACKED: "COD",
+  COD_ORDER_NOT_BOOKED: "COD",
+  COD_NOT_REMITTED: "COD",
+  COD_REMITTANCE_SHORTFALL: "COD",
+  COURIER_OVERCHARGE: "COD",
+  RETURNED_ORDER_BOOKED: "COD",
+  PARCEL_LOST_OR_STUCK: "COD",
+};
+
+const UPLOAD_TARGETS: { value: IngestTarget; label: string; job: string }[] = [
+  { value: "ecom_orders", label: "ERP / storefront orders", job: "Order ingestion" },
+  { value: "gateway_transactions", label: "Gateway settlements", job: "Gateway ingestion" },
+  { value: "courier_remittances", label: "Courier COD report", job: "Courier ingestion" },
+  { value: "bank_transactions", label: "Bank statement", job: "Bank ingestion" },
+];
 
 /* ============================================================================
  * Primitive UI
@@ -343,7 +439,7 @@ function TypingDots() {
 }
 
 function Badge({ children, className }: { children: ReactNode; className: string }) {
-  return <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset ${className}`}>{children}</span>;
+  return <span className={`inline-flex items-center whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset ${className}`}>{children}</span>;
 }
 
 function ConfidenceMeter({ value }: { value: Money | null }) {
@@ -464,7 +560,7 @@ function MetricsRow({ metrics, loading }: { metrics: DashboardMetrics | null; lo
         label="Auto-Healed"
         tone="text-emerald-300"
         value={money(metrics?.auto_healed_value, c, true)}
-        sub={metrics ? `${integer(metrics.auto_healed_count)} resolved by AI` : undefined}
+        sub={metrics ? `${integer(metrics.auto_healed_count)} by AI · ${pct(metrics.auto_heal_rate_pct)}` : undefined}
       />
       <MetricTile
         loading={loading}
@@ -475,22 +571,24 @@ function MetricsRow({ metrics, loading }: { metrics: DashboardMetrics | null; lo
       />
       <MetricTile
         loading={loading}
-        label="Auto-Heal Rate"
-        value={metrics ? pct(metrics.auto_heal_rate_pct) : "—"}
-        sub={metrics ? `${integer(metrics.manual_resolved_count)} manual resolutions` : undefined}
+        label="Not Banked"
+        tone="text-violet-300"
+        value={money(metrics?.settlements_not_deposited, c, true)}
+        sub={metrics ? `of ${money(metrics.settlements_expected_total, c, true)} settled to bank` : undefined}
       />
       <MetricTile
         loading={loading}
-        label="Gateway Volume"
-        value={money(metrics?.total_gateway_gross, c, true)}
-        sub={metrics ? `${integer(metrics.total_gateway_transactions)} captures` : undefined}
+        label="COD With Couriers"
+        tone="text-orange-300"
+        value={money(metrics?.cod_pending_remittance, c, true)}
+        sub={metrics ? `${integer(metrics.cod_orders)} COD orders` : undefined}
       />
       <MetricTile
         loading={loading}
         label="Gateway Fees"
         tone="text-amber-300"
         value={money(metrics?.total_gateway_fees, c, true)}
-        sub={metrics && num(metrics.total_gateway_gross) > 0 ? `${((num(metrics.total_gateway_fees) / num(metrics.total_gateway_gross)) * 100).toFixed(2)}% effective rate` : undefined}
+        sub={metrics && num(metrics.total_gateway_gross) > 0 ? `${((num(metrics.total_gateway_fees) / num(metrics.total_gateway_gross)) * 100).toFixed(2)}% of ${money(metrics.total_gateway_gross, c, true)}` : undefined}
       />
     </div>
   );
@@ -498,7 +596,7 @@ function MetricsRow({ metrics, loading }: { metrics: DashboardMetrics | null; lo
 
 function LeakageBreakdown({ metrics, loading }: { metrics: DashboardMetrics | null; loading: boolean }) {
   const c = metrics?.brand_currency ?? "USD";
-  const max = Math.max(1, ...(metrics?.by_issue_type ?? []).map((i) => num(i.open_exposure)));
+  const max = Math.max(1, ...(metrics?.by_channel ?? []).map((ch) => num(ch.open_exposure)));
   return (
     <Card title="Leak State by Channel">
       {loading || !metrics ? (
@@ -508,22 +606,79 @@ function LeakageBreakdown({ metrics, loading }: { metrics: DashboardMetrics | nu
           ))}
         </div>
       ) : (
-        <ul className="space-y-4">
-          {metrics.by_issue_type.map((i) => (
-            <li key={i.issue_type}>
-              <div className="flex items-baseline justify-between text-sm">
-                <span className="text-slate-300">{ISSUE_META[i.issue_type].label}</span>
-                <span className="tabular font-medium text-slate-100">{money(i.open_exposure, c)}</span>
-              </div>
-              <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-ink-700">
-                <div className={`h-full rounded-full ${ISSUE_META[i.issue_type].bar}`} style={{ width: `${(num(i.open_exposure) / max) * 100}%` }} />
-              </div>
-              <p className="mt-1 text-[11px] text-slate-500">
-                {integer(i.open_count)} open · {integer(i.resolved_count)} resolved
-              </p>
-            </li>
-          ))}
+        <ul className="space-y-5">
+          {metrics.by_channel.map((ch) => {
+            const issues = metrics.by_issue_type.filter((i) => i.channel === ch.channel && i.open_count > 0);
+            return (
+              <li key={ch.channel}>
+                <div className="flex items-baseline justify-between text-sm">
+                  <span className="text-slate-200">{CHANNEL_META[ch.channel].label}</span>
+                  <span className="tabular font-medium text-slate-100">{money(ch.open_exposure, c)}</span>
+                </div>
+                <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-ink-700">
+                  <div className={`h-full rounded-full ${CHANNEL_META[ch.channel].bar}`} style={{ width: `${(num(ch.open_exposure) / max) * 100}%` }} />
+                </div>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  {integer(ch.open_count)} open · {integer(ch.resolved_count)} resolved · {CHANNEL_META[ch.channel].hint}
+                </p>
+                {issues.length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1">
+                    {issues.map((i) => (
+                      <Badge key={i.issue_type} className={ISSUE_META[i.issue_type].tone}>
+                        {ISSUE_META[i.issue_type].label} · {integer(i.open_count)}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
+      )}
+    </Card>
+  );
+}
+
+function CourierLedger({ metrics, loading }: { metrics: DashboardMetrics | null; loading: boolean }) {
+  const c = metrics?.brand_currency ?? "USD";
+  const rows = metrics?.courier_summary ?? [];
+  return (
+    <Card title="Courier COD Ledger">
+      {loading || !metrics ? (
+        <Skeleton className="h-24" />
+      ) : rows.length === 0 ? (
+        <p className="text-sm text-slate-500">No courier report uploaded yet. Upload a TCS, Leopards, PostEx or Trax COD report to see who owes you cash.</p>
+      ) : (
+        <div className="-mx-5 overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                <th className="px-5 pb-2 font-medium">Courier</th>
+                <th className="pb-2 text-right font-medium">Delivered</th>
+                <th className="pb-2 text-right font-medium">COD collected</th>
+                <th className="pb-2 text-right font-medium">Remitted</th>
+                <th className="pb-2 text-right font-medium">With courier</th>
+                <th className="pb-2 text-right font-medium">Overdue</th>
+                <th className="px-5 pb-2 text-right font-medium">Return rate</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ink-700">
+              {rows.map((r) => (
+                <tr key={r.courier_name}>
+                  <td className="px-5 py-2 font-medium text-slate-200">{r.courier_name}</td>
+                  <td className="tabular py-2 text-right text-slate-300">{integer(r.delivered)}</td>
+                  <td className="tabular py-2 text-right text-slate-300">{money(r.cod_collected, c)}</td>
+                  <td className="tabular py-2 text-right text-slate-300">{money(r.remitted, c)}</td>
+                  <td className="tabular py-2 text-right text-orange-300">{money(r.pending_remittance, c)}</td>
+                  <td className={`tabular py-2 text-right ${num(r.overdue_remittance) > 0 ? "font-medium text-rose-300" : "text-slate-500"}`}>
+                    {money(r.overdue_remittance, c)}
+                  </td>
+                  <td className="tabular px-5 py-2 text-right text-slate-300">{pct(r.return_rate_pct)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </Card>
   );
@@ -572,9 +727,24 @@ function RootCausePanel({ metrics, loading }: { metrics: DashboardMetrics | null
 /* ============================================================================
  * Tracking matrix (discrepancy explorer with nested fix previews)
  * ========================================================================== */
+const FACT_FIELDS: [string, string, boolean][] = [
+  ["days_outstanding", "Days outstanding", false],
+  ["days_since_delivery", "Days since delivery", false],
+  ["batch_items", "Items in batch", false],
+  ["claim_amount", "Claim amount", true],
+  ["recoverable_amount", "Recoverable", true],
+  ["excess_amount", "Excess charged", true],
+  ["refund_amount", "Refund", true],
+  ["receivable_amount", "Receivable", true],
+  ["unbooked_amount", "Unbooked", true],
+  ["narration", "Bank narration", false],
+];
+
 function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: string }) {
   if (!fix) return <p className="text-xs text-slate-500">No AI analysis attached yet.</p>;
   const events = fix.evidence?.events ?? [];
+  const facts = FACT_FIELDS.filter(([key]) => fix[key] !== undefined && fix[key] !== null);
+  const records = fix.evidence && events.length === 0 ? Object.entries(fix.evidence).filter(([, v]) => v !== null && v !== "") : [];
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <div className="space-y-2">
@@ -582,6 +752,16 @@ function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: str
         <p className="font-mono text-sm text-emerald-300">{fix.action ?? "—"}</p>
         {fix.reason && <p className="text-xs leading-relaxed text-slate-400">{fix.reason}</p>}
         {fix.priority && <Badge className="text-amber-300 bg-amber-500/10 ring-amber-500/30">Priority {fix.priority}</Badge>}
+        {facts.length > 0 && (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs">
+            {facts.map(([key, label, isMoney]) => (
+              <Fragment key={key}>
+                <dt className="text-slate-500">{label}</dt>
+                <dd className="tabular text-slate-200">{isMoney ? money(fix[key] as number, currency) : cell(fix[key])}</dd>
+              </Fragment>
+            ))}
+          </dl>
+        )}
         {fix.transform && (
           <div className="rounded-lg border border-ink-600 bg-ink-850 p-2.5 font-mono text-[11px] text-slate-300">
             <span className="text-slate-500">{fix.target_table}.</span>
@@ -628,7 +808,7 @@ function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: str
         )}
       </div>
       <div>
-        <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Gateway API evidence</p>
+        <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Evidence</p>
         {events.length > 0 ? (
           <ul className="space-y-1.5">
             {events.map((ev) => (
@@ -642,8 +822,17 @@ function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: str
               <li className="text-[11px] text-slate-500">Discount codes in checkout log: {fix.evidence.discount_codes_seen.join(", ")}</li>
             )}
           </ul>
+        ) : records.length > 0 ? (
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 rounded-lg border border-ink-600 bg-ink-850 p-2.5 font-mono text-[11px]">
+            {records.map(([key, value]) => (
+              <Fragment key={key}>
+                <dt className="text-slate-500">{key.replace(/_cents$/, "")}</dt>
+                <dd className="break-all text-slate-300">{key.endsWith("_cents") ? money(Number(value) / 100, currency) : cell(value)}</dd>
+              </Fragment>
+            ))}
+          </dl>
         ) : (
-          <p className="text-xs text-slate-500">No gateway capture exists for this reference.</p>
+          <p className="text-xs text-slate-500">No supporting gateway, courier or bank record exists for this reference.</p>
         )}
       </div>
     </div>
@@ -653,6 +842,7 @@ function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: str
 function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: { token: string; currency: string; refreshKey: number; canResolve: boolean; onChanged: () => void }) {
   const [status, setStatus] = useState<DiscrepancyStatus | "">("UNRESOLVED");
   const [issue, setIssue] = useState<IssueType | "">("");
+  const [channel, setChannel] = useState<Channel | "">("");
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
   const [offset, setOffset] = useState(0);
@@ -668,13 +858,14 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
     return () => clearTimeout(t);
   }, [search]);
 
-  useEffect(() => setOffset(0), [status, issue, debounced]);
+  useEffect(() => setOffset(0), [status, issue, channel, debounced]);
 
   useEffect(() => {
     let cancelled = false;
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset), sort: "variance" });
     if (status) params.set("status", status);
     if (issue) params.set("issue_type", issue);
+    if (channel) params.set("channel", channel);
     if (debounced) params.set("search", debounced);
     setLoading(true);
     api<DiscrepancyPage>(`/api/v1/discrepancies?${params.toString()}`, token)
@@ -689,7 +880,7 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
     return () => {
       cancelled = true;
     };
-  }, [token, status, issue, debounced, offset, refreshKey]);
+  }, [token, status, issue, channel, debounced, offset, refreshKey]);
 
   async function resolve(d: Discrepancy) {
     const note = window.prompt(`Resolution note for ${d.source_order_number}`, "Verified against bank statement");
@@ -716,7 +907,22 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
       title="Discrepancy Tracking Matrix"
       action={
         <div className="flex flex-wrap items-center gap-2">
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search order #" className={`${select} w-36`} />
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search order / ref" className={`${select} w-36`} />
+          <select
+            value={channel}
+            onChange={(e) => {
+              setChannel(e.target.value as Channel | "");
+              setIssue("");
+            }}
+            className={select}
+          >
+            <option value="">All channels</option>
+            {(Object.keys(CHANNEL_META) as Channel[]).map((k) => (
+              <option key={k} value={k}>
+                {CHANNEL_META[k].label}
+              </option>
+            ))}
+          </select>
           <select value={status} onChange={(e) => setStatus(e.target.value as DiscrepancyStatus | "")} className={select}>
             <option value="">All statuses</option>
             <option value="UNRESOLVED">Unresolved</option>
@@ -724,11 +930,19 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
           </select>
           <select value={issue} onChange={(e) => setIssue(e.target.value as IssueType | "")} className={select}>
             <option value="">All issue types</option>
-            {(Object.keys(ISSUE_META) as IssueType[]).map((k) => (
-              <option key={k} value={k}>
-                {ISSUE_META[k].label}
-              </option>
-            ))}
+            {(Object.keys(CHANNEL_META) as Channel[])
+              .filter((ch) => !channel || ch === channel)
+              .map((ch) => (
+                <optgroup key={ch} label={CHANNEL_META[ch].label}>
+                  {(Object.keys(ISSUE_META) as IssueType[])
+                    .filter((k) => ISSUE_CHANNEL[k] === ch)
+                    .map((k) => (
+                      <option key={k} value={k}>
+                        {ISSUE_META[k].label}
+                      </option>
+                    ))}
+                </optgroup>
+              ))}
           </select>
         </div>
       }
@@ -740,8 +954,8 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
             <tr className="border-b border-ink-700 text-left text-[11px] uppercase tracking-wider text-slate-500">
               <th className="px-5 pb-2 font-medium">Order ref</th>
               <th className="pb-2 font-medium">Issue</th>
-              <th className="pb-2 text-right font-medium">ERP</th>
-              <th className="pb-2 text-right font-medium">Gateway</th>
+              <th className="pb-2 text-right font-medium">Expected</th>
+              <th className="pb-2 text-right font-medium">Received</th>
               <th className="pb-2 text-right font-medium">Variance</th>
               <th className="pb-2 pl-5 font-medium">AI root cause</th>
               <th className="pb-2 font-medium">Confidence</th>
@@ -851,8 +1065,8 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
 const SUGGESTIONS = [
   "What is our total open revenue leakage by issue type?",
   "Which findings did the auto-healer resolve and how much value?",
-  "Show suspicious fraud risk items",
-  "What are our monthly gateway fees as a percentage of volume?",
+  "Which courier owes us the most COD?",
+  "Which payouts never reached the bank?",
 ];
 
 function ResultTable({ answer }: { answer: AgentAnswer }) {
@@ -1018,8 +1232,8 @@ function JobBar({ token, canWrite, onCompleted }: { token: string; canWrite: boo
   const [job, setJob] = useState<Job | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const ordersInput = useRef<HTMLInputElement>(null);
-  const gatewayInput = useRef<HTMLInputElement>(null);
+  const [target, setTarget] = useState<IngestTarget>("ecom_orders");
+  const fileInput = useRef<HTMLInputElement>(null);
 
   async function track(accepted: JobAccepted, label: string) {
     setBusy(label);
@@ -1046,7 +1260,7 @@ function JobBar({ token, canWrite, onCompleted }: { token: string; canWrite: boo
     }
   }
 
-  async function upload(target: "ecom_orders" | "gateway_transactions", file: File | undefined) {
+  async function upload(file: File | undefined) {
     if (!file) return;
     setError(null);
     const form = new FormData();
@@ -1054,7 +1268,7 @@ function JobBar({ token, canWrite, onCompleted }: { token: string; canWrite: boo
     try {
       setBusy("Uploading");
       const accepted = await api<JobAccepted>(`/api/v1/ingest/${target}`, token, { method: "POST", body: form });
-      await track(accepted, target === "ecom_orders" ? "Order ingestion" : "Gateway ingestion");
+      await track(accepted, UPLOAD_TARGETS.find((t) => t.value === target)?.job ?? "Ingestion");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Upload failed");
       setBusy(null);
@@ -1066,13 +1280,22 @@ function JobBar({ token, canWrite, onCompleted }: { token: string; canWrite: boo
   return (
     <div className="flex flex-col items-start gap-2 md:items-end">
       <div className="flex flex-wrap items-center gap-2">
-        <input ref={ordersInput} type="file" accept=".csv,.tsv,.txt" hidden onChange={(e) => { void upload("ecom_orders", e.target.files?.[0]); e.target.value = ""; }} />
-        <input ref={gatewayInput} type="file" accept=".csv,.tsv,.txt" hidden onChange={(e) => { void upload("gateway_transactions", e.target.files?.[0]); e.target.value = ""; }} />
-        <button disabled={!canWrite || !!busy} onClick={() => ordersInput.current?.click()} className={`${button} border border-ink-600 text-slate-300 hover:border-slate-400`}>
-          Upload ERP orders
-        </button>
-        <button disabled={!canWrite || !!busy} onClick={() => gatewayInput.current?.click()} className={`${button} border border-ink-600 text-slate-300 hover:border-slate-400`}>
-          Upload gateway file
+        <input ref={fileInput} type="file" accept=".csv,.tsv,.txt" hidden onChange={(e) => { void upload(e.target.files?.[0]); e.target.value = ""; }} />
+        <select
+          aria-label="File type to upload"
+          value={target}
+          disabled={!canWrite || !!busy}
+          onChange={(e) => setTarget(e.target.value as IngestTarget)}
+          className="rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-2 text-xs text-slate-200 outline-none focus:border-emerald-500 disabled:opacity-50"
+        >
+          {UPLOAD_TARGETS.map((t) => (
+            <option key={t.value} value={t.value}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+        <button disabled={!canWrite || !!busy} onClick={() => fileInput.current?.click()} className={`${button} border border-ink-600 text-slate-300 hover:border-slate-400`}>
+          Upload file
         </button>
         <button disabled={!canWrite || !!busy} onClick={() => void runReconciliation()} className={`${button} bg-emerald-500 text-ink-950 hover:bg-emerald-400`}>
           {busy ? <Spinner /> : null}
@@ -1193,6 +1416,9 @@ export default function DashboardPage() {
               <RootCausePanel metrics={metrics} loading={loading && !metrics} />
             </PanelBoundary>
           </div>
+          <PanelBoundary title="Courier ledger">
+            <CourierLedger metrics={metrics} loading={loading && !metrics} />
+          </PanelBoundary>
           <PanelBoundary title="Tracking matrix">
             <TrackingMatrix token={session.token} currency={currency} refreshKey={refreshKey} canResolve={canResolve} onChanged={refresh} />
           </PanelBoundary>

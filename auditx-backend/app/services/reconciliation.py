@@ -1,10 +1,15 @@
-"""Multi-channel reconciliation engine (orders <-> payment gateway).
+"""Multi-channel reconciliation engine.
+
+One run reconciles three legs for a tenant and rebuilds its open findings in one transaction:
+  GATEWAY  prepaid orders <-> payment-gateway captures              (this module)
+  BANK     gateway payouts + courier remittances <-> bank credits   (bank_reconciliation.py)
+  COD      cash-on-delivery orders <-> courier parcel reports       (cod_reconciliation.py)
 
 All arithmetic is done in integer cents to avoid floating point drift. Each tenant is reconciled in
 isolation: every query is filtered by `org_id` and results are written back to `discrepancy_logs`
 in a single transaction (open findings are rebuilt, resolved findings are preserved).
 
-Sign convention: variance_amount = order_amount - gateway_amount
+Sign convention: variance_amount = order_amount - gateway_amount, i.e. expected - received on every leg
     > 0  -> money expected but not collected (leakage)
     < 0  -> money collected that the books do not explain (untracked revenue / over-capture)
 """
@@ -13,8 +18,8 @@ from __future__ import annotations
 import io
 import logging
 import time
-from dataclasses import dataclass
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict
 from uuid import UUID
 
 import numpy as np
@@ -23,6 +28,8 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
+from app.services.bank_reconciliation import reconcile_bank
+from app.services.cod_reconciliation import reconcile_cod
 
 logger = logging.getLogger("auditx.reconciliation")
 
@@ -33,6 +40,7 @@ ORDERS_SQL = text(
            COUNT(*)::int                          AS order_rows
       FROM ecom_orders
      WHERE org_id = :org_id
+       AND payment_method = 'PREPAID'
      GROUP BY source_order_number
     """
 )
@@ -64,11 +72,15 @@ LOG_COLUMNS = [
     "org_id",
     "source_order_number",
     "issue_type",
+    "channel",
     "order_amount",
     "gateway_amount",
     "variance_amount",
     "status",
 ]
+
+
+FINDING_COLUMNS = ["source_order_number", "issue_type", "channel", "order_cents", "gateway_cents", "variance_cents"]
 
 
 @dataclass
@@ -84,15 +96,13 @@ class ReconciliationReport:
     leakage_exposure: float
     untracked_exposure: float
     elapsed_ms: int
-
-    @property
-    def discrepancies_logged(self) -> int:
-        return self.missing_payments + self.untracked_revenue + self.amount_mismatches
+    discrepancies_logged: int = 0
+    by_issue_type: Dict[str, int] = field(default_factory=dict)
+    bank: Dict[str, Any] = field(default_factory=dict)
+    cod: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, object]:
-        data = dict(self.__dict__)
-        data["discrepancies_logged"] = self.discrepancies_logged
-        return data
+        return dict(self.__dict__)
 
 
 def _load_frames(org_id: UUID) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -123,6 +133,7 @@ def classify(orders: pd.DataFrame, gateway: pd.DataFrame, tolerance_cents: int) 
         ["MISSING_PAYMENT", "UNTRACKED_REVENUE", "AMOUNT_MISMATCH"],
         default="MATCHED",
     )
+    merged["channel"] = "GATEWAY"
     return merged
 
 
@@ -157,6 +168,7 @@ def _write_logs(org_id: UUID, findings: pd.DataFrame) -> None:
             "org_id": str(org_id),
             "source_order_number": findings["source_order_number"].to_numpy(),
             "issue_type": findings["issue_type"].to_numpy(),
+            "channel": findings["channel"].to_numpy(),
             "order_amount": _cents_to_text(findings["order_cents"].astype("Int64")).to_numpy(),
             "gateway_amount": _cents_to_text(findings["gateway_cents"].astype("Int64")).to_numpy(),
             "variance_amount": _cents_to_text(findings["variance_cents"]).to_numpy(),
@@ -195,11 +207,20 @@ def reconcile_org(org_id: UUID, tolerance_cents: int | None = None) -> Reconcili
 
     orders, gateway, resolved = _load_frames(org_id)
     classified = classify(orders, gateway, tolerance)
-    findings = classified.loc[classified["issue_type"] != "MATCHED"]
+    gateway_findings = classified.loc[classified["issue_type"] != "MATCHED", FINDING_COLUMNS]
+    bank_findings, bank_summary = reconcile_bank(org_id)
+    cod_findings, cod_summary = reconcile_cod(org_id)
+
+    legs = [f for f in (gateway_findings, bank_findings, cod_findings) if not f.empty]
+    findings = pd.concat(legs, ignore_index=True) if legs else pd.DataFrame(columns=FINDING_COLUMNS)
+    findings["variance_cents"] = findings["variance_cents"].astype("int64")
     findings, skipped = _exclude_resolved(findings, resolved)
     _write_logs(org_id, findings)
 
     counts = findings["issue_type"].value_counts()
+    for channel, summary in (("BANK", bank_summary), ("COD", cod_summary)):
+        leg_counts = findings.loc[findings["channel"] == channel, "issue_type"].value_counts()
+        summary["findings"] = {k: int(v) for k, v in leg_counts.items()}
     variance = findings["variance_cents"]
     report = ReconciliationReport(
         org_id=str(org_id),
@@ -213,6 +234,10 @@ def reconcile_org(org_id: UUID, tolerance_cents: int | None = None) -> Reconcili
         leakage_exposure=round(float(variance[variance > 0].sum()) / 100, 2),
         untracked_exposure=round(float(-variance[variance < 0].sum()) / 100, 2),
         elapsed_ms=int((time.perf_counter() - started) * 1000),
+        discrepancies_logged=int(len(findings)),
+        by_issue_type={k: int(v) for k, v in counts.items()},
+        bank=bank_summary,
+        cod=cod_summary,
     )
     logger.info("Reconciliation complete: %s", report.as_dict())
     return report

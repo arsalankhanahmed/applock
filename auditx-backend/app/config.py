@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     # Reconciliation tolerance in cents: variances at or below this are treated as matched.
     RECON_MATCH_TOLERANCE_CENTS: int = 0
 
+    # Bank leg: payouts / remittances get this many days to reach the bank before being flagged,
+    # and a deposit may land this many days after the settlement batch closes.
+    SETTLEMENT_LAG_DAYS: int = 7
+    BANK_MATCH_WINDOW_DAYS: int = 10
+
+    # COD leg timing (days, measured against the latest date seen in the tenant's data).
+    COD_DISPATCH_SLA_DAYS: int = 7
+    COD_REMITTANCE_SLA_DAYS: int = 10
+    PARCEL_STUCK_DAYS: int = 21
+    # A parcel's delivery charge is an overcharge above this multiple of the courier's median charge.
+    COURIER_OVERCHARGE_RATIO: float = 1.5
+
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TIMEOUT_SECONDS: float = 30.0

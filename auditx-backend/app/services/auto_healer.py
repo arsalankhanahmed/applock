@@ -1,7 +1,8 @@
 """AI Auto-Healer (Feature 1).
 
 Evaluates every open discrepancy for a tenant against a deterministic forensic rule-book, enriched
-with (simulated) raw gateway API log metadata. High-confidence, low-risk patterns are resolved
+with (simulated) raw gateway API log metadata, settlement-batch context (bank leg) and courier parcel
+records (COD leg). High-confidence, low-risk patterns are resolved
 autonomously (`auto_resolved = TRUE`); everything else receives a ranked root-cause hypothesis and a
 machine-readable fix proposal (`ai_suggested_fix` JSONB) for a human reviewer.
 """
@@ -33,6 +34,7 @@ OPEN_LOGS_SQL = text(
     SELECT log_id::text AS log_id,
            source_order_number,
            issue_type,
+           channel,
            ROUND(order_amount * 100)::bigint    AS order_cents,
            ROUND(gateway_amount * 100)::bigint  AS gateway_cents,
            ROUND(variance_amount * 100)::bigint AS variance_cents
@@ -56,6 +58,67 @@ GATEWAY_DETAIL_SQL = text(
 )
 
 ORG_SQL = text("SELECT brand_currency FROM organizations WHERE org_id = :org_id")
+
+SETTLEMENT_CTX_SQL = text(
+    """
+    SELECT payout_reference AS reference, 'GATEWAY_PAYOUT' AS source, NULL::text AS counterparty,
+           COUNT(*)::int AS items, MAX(processed_at) AS closed_at
+      FROM gateway_transactions
+     WHERE org_id = :org_id AND payout_reference = ANY(:refs)
+     GROUP BY payout_reference
+    UNION ALL
+    SELECT remittance_reference, 'COURIER_REMITTANCE', MIN(courier_name),
+           COUNT(*)::int, MAX(COALESCE(remitted_at, delivered_at))
+      FROM courier_remittances
+     WHERE org_id = :org_id AND remittance_reference = ANY(:refs)
+     GROUP BY remittance_reference
+    """
+)
+
+CREDIT_CTX_SQL = text(
+    """
+    SELECT bank_reference, description, transaction_date, bank_account
+      FROM bank_transactions
+     WHERE org_id = :org_id AND bank_reference = ANY(:refs)
+    """
+)
+
+PARCEL_CTX_SQL = text(
+    """
+    SELECT DISTINCT ON (source_order_number)
+           source_order_number, tracking_number, courier_name, parcel_status,
+           ROUND(cod_amount * 100)::bigint       AS cod_cents,
+           ROUND(delivery_charges * 100)::bigint AS charge_cents,
+           ROUND(net_remitted * 100)::bigint     AS net_cents,
+           remittance_reference, booked_at, delivered_at
+      FROM courier_remittances
+     WHERE org_id = :org_id AND source_order_number = ANY(:refs)
+     ORDER BY source_order_number,
+              CASE parcel_status WHEN 'DELIVERED' THEN 0 WHEN 'RETURNED' THEN 1 WHEN 'LOST' THEN 2 ELSE 3 END
+    """
+)
+
+COURIER_MEDIAN_SQL = text(
+    """
+    SELECT courier_name,
+           ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY delivery_charges) * 100)::bigint AS median_cents
+      FROM courier_remittances
+     WHERE org_id = :org_id AND parcel_status = 'DELIVERED'
+     GROUP BY courier_name
+    """
+)
+
+AS_OF_SQL = text(
+    """
+    SELECT GREATEST(
+             (SELECT MAX(GREATEST(booked_at, delivered_at, remitted_at)) FROM courier_remittances WHERE org_id = :org_id),
+             (SELECT MAX(transaction_date) FROM bank_transactions WHERE org_id = :org_id))
+    """
+)
+
+BANK_CHARGE_MAX_RATIO = 0.005
+BANK_CHARGE_MAX_CENTS = 2_500
+OVERDUE_ESCALATION_DAYS = 30
 
 
 @dataclass
@@ -247,6 +310,200 @@ def evaluate(row: Dict[str, Any], txns: List[Dict[str, Any]], brand_currency: st
     })
 
 
+def _plain(record: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-safe copy of a pandas record (NaN / NaT -> None, numpy scalars -> Python, timestamps -> ISO)."""
+    out: Dict[str, Any] = {}
+    for key, value in record.items():
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            out[key] = None
+        elif isinstance(value, (datetime, pd.Timestamp)):
+            out[key] = value.isoformat()
+        elif hasattr(value, "item"):
+            out[key] = value.item()
+        else:
+            out[key] = value
+    return out
+
+
+def _days_since(moment: Any, as_of: Optional[datetime]) -> Optional[int]:
+    if moment is None or as_of is None or pd.isna(moment):
+        return None
+    return max(0, (pd.Timestamp(as_of) - pd.Timestamp(moment)).days)
+
+
+def evaluate_bank(row: Dict[str, Any], ctx: Dict[str, Any]) -> Verdict:
+    """Bank leg: settlement batches vs statement credits."""
+    issue = row["issue_type"]
+    ref = row["source_order_number"]
+    variance = int(row["variance_cents"])
+    expected = row["order_cents"] or 0
+    batch = ctx["settlements"].get(ref, {})
+    source = batch.get("source", "SETTLEMENT")
+    evidence = _plain(batch)
+
+    if issue == "DEPOSIT_MISMATCH":
+        if 0 < variance < MICRO_VARIANCE_CENTS:
+            return Verdict("FX_ROUNDING_ERROR", 0.95, True, {
+                "action": "POST_ADJUSTING_JOURNAL_ENTRY",
+                "reason": "Sub-$0.50 gap between the settlement batch and the bank credit: conversion rounding.",
+                "target_table": "general_ledger",
+                "journal": _journal("7920-FX Rounding Differences", "1210-Settlement Clearing", variance,
+                                    f"Rounding on settlement {ref}"),
+                "evidence": evidence,
+            })
+        if variance > 0 and variance <= max(BANK_CHARGE_MAX_RATIO * expected, MICRO_VARIANCE_CENTS) \
+                and variance <= BANK_CHARGE_MAX_CENTS:
+            return Verdict("BANK_CHARGES_DEDUCTED", 0.88, True, {
+                "action": "POST_ADJUSTING_JOURNAL_ENTRY",
+                "reason": f"The bank credited {_money(variance)} less than the batch, within the "
+                          f"{BANK_CHARGE_MAX_RATIO:.1%} band typical of inward-remittance charges.",
+                "target_table": "general_ledger",
+                "journal": _journal("6200-Bank Charges", "1210-Settlement Clearing", variance,
+                                    f"Bank charges on settlement {ref}"),
+                "evidence": evidence,
+            })
+        if variance < 0:
+            return Verdict("SETTLEMENT_OVER_DEPOSIT", 0.6, False, {
+                "action": "INVESTIGATE_OVER_DEPOSIT",
+                "reason": "The bank received more than the batch: likely two batches paid together or a reversed refund.",
+                "priority": "MEDIUM",
+                "evidence": evidence,
+            })
+        return Verdict("UNEXPLAINED_SETTLEMENT_SHORTFALL", 0.5, False, {
+            "action": "REQUEST_SETTLEMENT_STATEMENT",
+            "reason": f"The bank credited {_money(variance)} less than the {source.lower().replace('_', ' ')} "
+                      "and the gap is too large to be bank charges.",
+            "priority": "HIGH",
+            "evidence": evidence,
+        })
+
+    if issue == "SETTLEMENT_NOT_DEPOSITED":
+        days = _days_since(batch.get("closed_at"), ctx["as_of"])
+        if source == "COURIER_REMITTANCE":
+            category, party = "COURIER_REMITTANCE_NOT_RECEIVED", batch.get("counterparty") or "the courier"
+        else:
+            category, party = "GATEWAY_PAYOUT_NOT_RECEIVED", "the payment gateway"
+        return Verdict(category, 0.8, False, {
+            "action": "REQUEST_PAYMENT_TRACE",
+            "reason": f"{_money(expected)} reported as paid out by {party} never reached the bank statement.",
+            "priority": "HIGH" if (days or 0) > OVERDUE_ESCALATION_DAYS else "MEDIUM",
+            "days_outstanding": days,
+            "batch_items": batch.get("items"),
+            "next_steps": [
+                f"Ask {party} for the payment trace / UTR of batch {ref}",
+                "Check whether the payout went to a different bank account",
+                "Book a receivable until the funds arrive",
+            ],
+            "evidence": evidence,
+        })
+
+    credit = ctx["credits"].get(ref, {})
+    received = row["gateway_cents"] or 0
+    return Verdict("UNIDENTIFIED_SETTLEMENT_CREDIT", 0.6, False, {
+        "action": "ALLOCATE_OR_SUSPENSE",
+        "reason": "A gateway / courier credit hit the bank but matches no reported payout or remittance.",
+        "priority": "MEDIUM",
+        "narration": credit.get("description"),
+        "journal": _journal("1000-Bank", "2900-Suspense (Unidentified Receipts)", received,
+                            f"Unidentified settlement credit {ref}"),
+    })
+
+
+def evaluate_cod(row: Dict[str, Any], ctx: Dict[str, Any]) -> Verdict:
+    """COD leg: orders vs courier parcel records."""
+    issue = row["issue_type"]
+    order_no = row["source_order_number"]
+    variance = int(row["variance_cents"])
+    parcel = ctx["parcels"].get(order_no, {})
+    courier = parcel.get("courier_name") or "the courier"
+    evidence = _plain(parcel)
+
+    if issue == "COD_PARCEL_UNTRACKED":
+        return Verdict("COD_ORDER_NOT_DISPATCHED", 0.65, False, {
+            "action": "VERIFY_DISPATCH",
+            "reason": "COD order is past the dispatch window and no courier has a parcel for it.",
+            "priority": "MEDIUM",
+            "next_steps": ["Check the warehouse dispatch log", "Cancel the order if it was never shipped",
+                           "If shipped, get the tracking number from the courier"],
+        })
+    if issue == "COD_ORDER_NOT_BOOKED":
+        collected = row["gateway_cents"] or 0
+        return Verdict("UNBOOKED_COD_SALE", 0.75, False, {
+            "action": "CREATE_ORDER_IN_ERP",
+            "reason": f"{courier} delivered and collected cash for an order the ERP does not have.",
+            "priority": "HIGH",
+            "journal": _journal("1150-Courier Receivable", "4000-Revenue", collected, f"Unbooked COD sale {order_no}"),
+            "evidence": evidence,
+        })
+    if issue == "COD_NOT_REMITTED":
+        days = _days_since(parcel.get("delivered_at"), ctx["as_of"])
+        return Verdict("COURIER_REMITTANCE_OVERDUE", 0.85, False, {
+            "action": "RAISE_COURIER_CLAIM",
+            "reason": f"{courier} delivered the parcel {days} days ago and has not remitted the cash.",
+            "priority": "HIGH" if (days or 0) > OVERDUE_ESCALATION_DAYS else "MEDIUM",
+            "days_since_delivery": days,
+            "claim_amount": _money(variance),
+            "evidence": evidence,
+        })
+    if issue == "COD_REMITTANCE_SHORTFALL":
+        order_total = (row["order_cents"] or 0) + int(parcel.get("charge_cents") or 0)
+        cod = int(parcel.get("cod_cents") or 0)
+        if cod < order_total:
+            return Verdict("RIDER_SHORT_COLLECTION", 0.8, False, {
+                "action": "RECOVER_FROM_COURIER",
+                "reason": f"The rider collected {_money(cod)} against an order of {_money(order_total)}.",
+                "priority": "HIGH",
+                "recoverable_amount": _money(variance),
+                "evidence": evidence,
+            })
+        return Verdict("COURIER_UNEXPLAINED_DEDUCTION", 0.75, False, {
+            "action": "DISPUTE_REMITTANCE",
+            "reason": f"{courier} remitted {_money(variance)} less than cash collected minus its own charges.",
+            "priority": "HIGH",
+            "evidence": evidence,
+        })
+    if issue == "COURIER_OVERCHARGE":
+        median = ctx["medians"].get(parcel.get("courier_name"))
+        return Verdict("EXCESS_COURIER_CHARGES", 0.82, False, {
+            "action": "DISPUTE_COURIER_INVOICE",
+            "reason": f"{courier} charged {_money(parcel.get('charge_cents'))} where its usual charge is "
+                      f"{_money(median)}.",
+            "priority": "MEDIUM",
+            "excess_amount": _money(variance),
+            "evidence": evidence,
+        })
+    if issue == "RETURNED_ORDER_BOOKED":
+        return Verdict("REVENUE_NOT_REVERSED_ON_RETURN", 0.9, False, {
+            "action": "POST_SALES_RETURN",
+            "reason": "The parcel came back to the warehouse but the ERP still carries the sale.",
+            "priority": "MEDIUM",
+            "target_table": "ecom_orders",
+            "journal": _journal("4100-Sales Returns", "1100-Accounts Receivable", variance,
+                                f"Return of COD order {order_no}"),
+            "next_steps": ["Confirm the goods were received back into stock", "Reverse the sale in the ERP"],
+            "evidence": evidence,
+        })
+    days = _days_since(parcel.get("booked_at"), ctx["as_of"])
+    if parcel.get("parcel_status") == "LOST":
+        return Verdict("PARCEL_LOST_IN_TRANSIT", 0.85, False, {
+            "action": "FILE_LOSS_CLAIM",
+            "reason": f"{courier} reports the parcel as lost.",
+            "priority": "HIGH",
+            "claim_amount": _money(variance),
+            "evidence": evidence,
+        })
+    return Verdict("PARCEL_STUCK_IN_TRANSIT", 0.7, False, {
+        "action": "ESCALATE_TO_COURIER",
+        "reason": f"The parcel has been in transit for {days} days.",
+        "priority": "MEDIUM",
+        "evidence": evidence,
+    })
+
+
+def _records_by(frame: pd.DataFrame, key: str) -> Dict[str, Dict[str, Any]]:
+    return {rec[key]: rec for rec in frame.to_dict("records")}
+
+
 def _pair_format_drift(logs: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """Pair MISSING_PAYMENT and UNTRACKED_REVENUE logs whose order refs normalise identically and amounts agree."""
     missing = logs[logs["issue_type"] == "MISSING_PAYMENT"]
@@ -276,8 +533,23 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
         logs = pd.read_sql(OPEN_LOGS_SQL, conn, params=params)
         if logs.empty:
             return {"evaluated": 0, "auto_resolved": 0, "auto_resolved_value": 0.0, "by_category": {}}
-        order_numbers = logs["source_order_number"].unique().tolist()
-        details = pd.read_sql(GATEWAY_DETAIL_SQL, conn, params={**params, "order_numbers": order_numbers})
+        gateway_refs = logs.loc[logs["channel"] == "GATEWAY", "source_order_number"].unique().tolist()
+        bank_refs = logs.loc[logs["channel"] == "BANK", "source_order_number"].unique().tolist()
+        cod_refs = logs.loc[logs["channel"] == "COD", "source_order_number"].unique().tolist()
+        details = pd.read_sql(GATEWAY_DETAIL_SQL, conn, params={**params, "order_numbers": gateway_refs})
+        ctx: Dict[str, Any] = {"settlements": {}, "credits": {}, "parcels": {}, "medians": {}, "as_of": None}
+        if bank_refs or cod_refs:
+            ctx["as_of"] = conn.execute(AS_OF_SQL, params).scalar()
+        if bank_refs:
+            ctx["settlements"] = _records_by(
+                pd.read_sql(SETTLEMENT_CTX_SQL, conn, params={**params, "refs": bank_refs}), "reference")
+            ctx["credits"] = _records_by(
+                pd.read_sql(CREDIT_CTX_SQL, conn, params={**params, "refs": bank_refs}), "bank_reference")
+        if cod_refs:
+            ctx["parcels"] = _records_by(
+                pd.read_sql(PARCEL_CTX_SQL, conn, params={**params, "refs": cod_refs}), "source_order_number")
+            medians = pd.read_sql(COURIER_MEDIAN_SQL, conn, params=params)
+            ctx["medians"] = dict(zip(medians["courier_name"], medians["median_cents"].astype(int)))
 
     txns_by_order: Dict[str, List[Dict[str, Any]]] = {}
     for rec in details.to_dict("records"):
@@ -292,8 +564,13 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
     for rec in logs.to_dict("records"):
         rec["order_cents"] = _nullable_int(rec["order_cents"])
         rec["gateway_cents"] = _nullable_int(rec["gateway_cents"])
-        verdict = evaluate(rec, txns_by_order.get(rec["source_order_number"], []), brand_currency,
-                           partners.get(rec["log_id"]))
+        if rec["channel"] == "BANK":
+            verdict = evaluate_bank(rec, ctx)
+        elif rec["channel"] == "COD":
+            verdict = evaluate_cod(rec, ctx)
+        else:
+            verdict = evaluate(rec, txns_by_order.get(rec["source_order_number"], []), brand_currency,
+                               partners.get(rec["log_id"]))
         by_category[verdict.category] = by_category.get(verdict.category, 0) + 1
         if verdict.auto_resolve:
             auto_count += 1

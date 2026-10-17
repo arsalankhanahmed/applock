@@ -9,9 +9,28 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class IssueType(str, Enum):
+    # Gateway leg
     MISSING_PAYMENT = "MISSING_PAYMENT"
     UNTRACKED_REVENUE = "UNTRACKED_REVENUE"
     AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
+    # Bank leg
+    SETTLEMENT_NOT_DEPOSITED = "SETTLEMENT_NOT_DEPOSITED"
+    DEPOSIT_MISMATCH = "DEPOSIT_MISMATCH"
+    UNMATCHED_DEPOSIT = "UNMATCHED_DEPOSIT"
+    # COD leg
+    COD_PARCEL_UNTRACKED = "COD_PARCEL_UNTRACKED"
+    COD_ORDER_NOT_BOOKED = "COD_ORDER_NOT_BOOKED"
+    COD_NOT_REMITTED = "COD_NOT_REMITTED"
+    COD_REMITTANCE_SHORTFALL = "COD_REMITTANCE_SHORTFALL"
+    COURIER_OVERCHARGE = "COURIER_OVERCHARGE"
+    RETURNED_ORDER_BOOKED = "RETURNED_ORDER_BOOKED"
+    PARCEL_LOST_OR_STUCK = "PARCEL_LOST_OR_STUCK"
+
+
+class Channel(str, Enum):
+    GATEWAY = "GATEWAY"
+    BANK = "BANK"
+    COD = "COD"
 
 
 class DiscrepancyStatus(str, Enum):
@@ -30,11 +49,15 @@ class UserRole(str, Enum):
 class IngestTarget(str, Enum):
     ecom_orders = "ecom_orders"
     gateway_transactions = "gateway_transactions"
+    bank_transactions = "bank_transactions"
+    courier_remittances = "courier_remittances"
 
 
 class JobType(str, Enum):
     INGEST_ORDERS = "INGEST_ORDERS"
     INGEST_GATEWAY = "INGEST_GATEWAY"
+    INGEST_BANK = "INGEST_BANK"
+    INGEST_COURIER = "INGEST_COURIER"
     RECONCILIATION = "RECONCILIATION"
 
 
@@ -148,6 +171,7 @@ class DiscrepancyOut(BaseModel):
     log_id: UUID
     source_order_number: str
     issue_type: IssueType
+    channel: Channel
     order_amount: Optional[Decimal]
     gateway_amount: Optional[Decimal]
     variance_amount: Decimal
@@ -175,6 +199,7 @@ class ManualResolveRequest(BaseModel):
 # ---------------------------------------------------------------- dashboard
 class IssueBreakdown(BaseModel):
     issue_type: IssueType
+    channel: Channel
     open_count: int
     open_exposure: Decimal
     resolved_count: int
@@ -185,6 +210,26 @@ class RootCauseBreakdown(BaseModel):
     count: int
     exposure: Decimal
     avg_confidence: Optional[Decimal]
+
+
+class ChannelBreakdown(BaseModel):
+    channel: Channel
+    open_count: int
+    open_exposure: Decimal
+    resolved_count: int
+
+
+class CourierSummary(BaseModel):
+    courier_name: str
+    parcels: int
+    delivered: int
+    returned: int
+    cod_collected: Decimal
+    charges: Decimal
+    remitted: Decimal
+    pending_remittance: Decimal
+    overdue_remittance: Decimal
+    return_rate_pct: Decimal
 
 
 class DashboardMetrics(BaseModel):
@@ -202,8 +247,15 @@ class DashboardMetrics(BaseModel):
     manual_resolved_count: int
     match_rate_pct: Decimal
     auto_heal_rate_pct: Decimal
+    bank_credits_total: Decimal
+    settlements_expected_total: Decimal
+    settlements_not_deposited: Decimal
+    cod_orders: int
+    cod_pending_remittance: Decimal
+    by_channel: List[ChannelBreakdown]
     by_issue_type: List[IssueBreakdown]
     by_root_cause: List[RootCauseBreakdown]
+    courier_summary: List[CourierSummary]
     last_reconciliation_at: Optional[datetime]
 
 
