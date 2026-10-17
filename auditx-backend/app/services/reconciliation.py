@@ -7,7 +7,8 @@ One run reconciles three legs for a tenant and rebuilds its open findings in one
 
 All arithmetic is done in integer cents to avoid floating point drift. Each tenant is reconciled in
 isolation: every query is filtered by `org_id` and results are written back to `discrepancy_logs`
-in a single transaction (open findings are rebuilt, resolved findings are preserved).
+in a single transaction (open findings are rebuilt; resolved findings and findings awaiting a checker's
+approval are preserved and not re-raised).
 
 Sign convention: variance_amount = order_amount - gateway_amount, i.e. expected - received on every leg
     > 0  -> money expected but not collected (leakage)
@@ -64,7 +65,7 @@ RESOLVED_SQL = text(
            ROUND(variance_amount * 100)::bigint AS variance_cents
       FROM discrepancy_logs
      WHERE org_id = :org_id
-       AND status = 'RESOLVED'
+       AND status IN ('RESOLVED', 'PENDING_APPROVAL')
     """
 )
 

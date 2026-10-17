@@ -35,7 +35,21 @@ class Channel(str, Enum):
 
 class DiscrepancyStatus(str, Enum):
     UNRESOLVED = "UNRESOLVED"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
     RESOLVED = "RESOLVED"
+
+
+class RequestStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    WITHDRAWN = "WITHDRAWN"
+
+
+class AutoHealMode(str, Enum):
+    AUTO = "AUTO"
+    THRESHOLD = "THRESHOLD"
+    ALWAYS_APPROVE = "ALWAYS_APPROVE"
 
 
 class UserRole(str, Enum):
@@ -191,6 +205,76 @@ class DiscrepancyPage(BaseModel):
     items: List[DiscrepancyOut]
 
 
+class UserCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=255)
+    email: EmailStr
+    password: str = Field(min_length=10, max_length=128)
+    role: UserRole
+
+
+class UserOut(BaseModel):
+    user_id: UUID
+    full_name: str
+    email: EmailStr
+    role: UserRole
+    created_at: datetime
+
+
+# ---------------------------------------------------------------- maker-checker
+class ApprovalPolicyIn(BaseModel):
+    auto_heal_mode: AutoHealMode = AutoHealMode.THRESHOLD
+    auto_heal_max_amount: Decimal = Field(default=Decimal("1.00"), ge=0, max_digits=18, decimal_places=2)
+    manual_requires_approval: bool = True
+    manual_auto_approve_max: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+
+
+class ApprovalPolicyOut(ApprovalPolicyIn):
+    updated_at: Optional[datetime] = None
+    updated_by_email: Optional[str] = None
+
+
+class ApprovalRequestOut(BaseModel):
+    request_id: UUID
+    log_id: Optional[UUID]
+    source_order_number: str
+    issue_type: IssueType
+    channel: Channel
+    amount: Decimal
+    root_cause_category: Optional[str]
+    proposed_fix: Optional[Dict[str, Any]]
+    proposed_by_type: str
+    proposed_by_email: Optional[str]
+    maker_note: Optional[str]
+    status: RequestStatus
+    decided_by_email: Optional[str]
+    checker_note: Optional[str]
+    created_at: datetime
+    decided_at: Optional[datetime]
+    is_mine: bool = False
+
+
+class ApprovalPage(BaseModel):
+    total: int
+    pending_value: Decimal
+    limit: int
+    offset: int
+    items: List[ApprovalRequestOut]
+
+
+class DecisionRequest(BaseModel):
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class BulkDecisionRequest(BaseModel):
+    request_ids: List[UUID] = Field(min_length=1, max_length=500)
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class BulkDecisionResult(BaseModel):
+    approved: List[UUID]
+    failed: Dict[str, str]
+
+
 class ManualResolveRequest(BaseModel):
     resolution_note: str = Field(min_length=3, max_length=1000)
     root_cause_category: Optional[str] = Field(default=None, max_length=64)
@@ -252,6 +336,8 @@ class DashboardMetrics(BaseModel):
     settlements_not_deposited: Decimal
     cod_orders: int
     cod_pending_remittance: Decimal
+    pending_approval_count: int
+    pending_approval_value: Decimal
     by_channel: List[ChannelBreakdown]
     by_issue_type: List[IssueBreakdown]
     by_root_cause: List[RootCauseBreakdown]

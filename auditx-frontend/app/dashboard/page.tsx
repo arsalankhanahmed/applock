@@ -32,7 +32,9 @@ type IssueType =
   | "RETURNED_ORDER_BOOKED"
   | "PARCEL_LOST_OR_STUCK";
 type IngestTarget = "ecom_orders" | "gateway_transactions" | "courier_remittances" | "bank_transactions";
-type DiscrepancyStatus = "UNRESOLVED" | "RESOLVED";
+type DiscrepancyStatus = "UNRESOLVED" | "PENDING_APPROVAL" | "RESOLVED";
+type RequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "WITHDRAWN";
+type AutoHealMode = "AUTO" | "THRESHOLD" | "ALWAYS_APPROVE";
 type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
 type JobType = "INGEST_ORDERS" | "INGEST_GATEWAY" | "INGEST_BANK" | "INGEST_COURIER" | "RECONCILIATION";
 type Money = string | number;
@@ -108,6 +110,8 @@ interface DashboardMetrics {
   settlements_not_deposited: Money;
   cod_orders: number;
   cod_pending_remittance: Money;
+  pending_approval_count: number;
+  pending_approval_value: Money;
   by_channel: ChannelBreakdown[];
   by_issue_type: IssueBreakdown[];
   by_root_cause: RootCauseBreakdown[];
@@ -146,7 +150,61 @@ interface SuggestedFix {
   evidence?: ({ events?: GatewayEvent[]; discount_codes_seen?: string[] } & Record<string, unknown>) | null;
   next_steps?: string[];
   manual_resolution?: { note: string; resolved_by: string; resolved_at: string };
+  approval?: ApprovalTrail;
   [key: string]: unknown;
+}
+
+interface ApprovalTrail {
+  status: string;
+  request_id?: string;
+  proposed_by?: string;
+  maker_note?: string | null;
+  approved_by?: string;
+  rejected_by?: string;
+  checker_note?: string | null;
+  note?: string;
+}
+
+interface ApprovalRequest {
+  request_id: string;
+  log_id: string | null;
+  source_order_number: string;
+  issue_type: IssueType;
+  channel: Channel;
+  amount: Money;
+  root_cause_category: string | null;
+  proposed_fix: SuggestedFix | null;
+  proposed_by_type: "AI" | "USER";
+  proposed_by_email: string | null;
+  maker_note: string | null;
+  status: RequestStatus;
+  decided_by_email: string | null;
+  checker_note: string | null;
+  created_at: string;
+  decided_at: string | null;
+  is_mine: boolean;
+}
+
+interface ApprovalPageData {
+  total: number;
+  pending_value: Money;
+  limit: number;
+  offset: number;
+  items: ApprovalRequest[];
+}
+
+interface ApprovalPolicy {
+  auto_heal_mode: AutoHealMode;
+  auto_heal_max_amount: Money;
+  manual_requires_approval: boolean;
+  manual_auto_approve_max: Money;
+  updated_at: string | null;
+  updated_by_email: string | null;
+}
+
+interface BulkResult {
+  approved: string[];
+  failed: Record<string, string>;
 }
 
 interface Discrepancy {
@@ -560,7 +618,7 @@ function MetricsRow({ metrics, loading }: { metrics: DashboardMetrics | null; lo
         label="Auto-Healed"
         tone="text-emerald-300"
         value={money(metrics?.auto_healed_value, c, true)}
-        sub={metrics ? `${integer(metrics.auto_healed_count)} by AI · ${pct(metrics.auto_heal_rate_pct)}` : undefined}
+        sub={metrics ? `${integer(metrics.auto_healed_count)} by AI · ${integer(metrics.pending_approval_count)} awaiting approval` : undefined}
       />
       <MetricTile
         loading={loading}
@@ -740,6 +798,29 @@ const FACT_FIELDS: [string, string, boolean][] = [
   ["narration", "Bank narration", false],
 ];
 
+function ApprovalTrailNote({ trail }: { trail: ApprovalTrail }) {
+  const tone =
+    trail.status === "APPROVED"
+      ? "bg-emerald-500/10 text-emerald-200"
+      : trail.status === "PENDING"
+        ? "bg-amber-500/10 text-amber-200"
+        : "bg-rose-500/10 text-rose-200";
+  const text =
+    trail.status === "APPROVED"
+      ? `Approved by ${trail.approved_by === "policy:auto" ? "policy (below the auto-approve limit)" : trail.approved_by}`
+      : trail.status === "PENDING"
+        ? `Awaiting a checker · proposed by ${trail.proposed_by ?? "AI Auto-Healer"}`
+        : trail.status === "REJECTED"
+          ? `Rejected by ${trail.rejected_by}`
+          : trail.note ?? "A checker rejected this AI fix earlier";
+  return (
+    <p className={`rounded-md px-2 py-1.5 text-xs ${tone}`}>
+      <span className="font-semibold">Maker-checker:</span> {text}
+      {trail.checker_note ? ` — “${trail.checker_note}”` : ""}
+    </p>
+  );
+}
+
 function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: string }) {
   if (!fix) return <p className="text-xs text-slate-500">No AI analysis attached yet.</p>;
   const events = fix.evidence?.events ?? [];
@@ -778,9 +859,10 @@ function FixPreview({ fix, currency }: { fix: SuggestedFix | null; currency: str
         )}
         {fix.manual_resolution && (
           <p className="rounded-md bg-sky-500/10 px-2 py-1.5 text-xs text-sky-200">
-            Resolved by {fix.manual_resolution.resolved_by}: “{fix.manual_resolution.note}”
+            Proposed by {fix.manual_resolution.resolved_by}: “{fix.manual_resolution.note}”
           </p>
         )}
+        {fix.approval && <ApprovalTrailNote trail={fix.approval} />}
       </div>
       <div>
         <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Journal entry</p>
@@ -851,6 +933,7 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [resolving, setResolving] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const limit = 15;
 
   useEffect(() => {
@@ -887,10 +970,15 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
     if (!note || note.trim().length < 3) return;
     setResolving(d.log_id);
     try {
-      await api(`/api/v1/discrepancies/${d.log_id}/resolve`, token, {
+      const updated = await api<Discrepancy>(`/api/v1/discrepancies/${d.log_id}/resolve`, token, {
         method: "POST",
         body: JSON.stringify({ resolution_note: note.trim() }),
       });
+      setNotice(
+        updated.status === "PENDING_APPROVAL"
+          ? `${d.source_order_number} sent to a checker for approval.`
+          : `${d.source_order_number} resolved (below the approval limit).`,
+      );
       onChanged();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Resolve failed");
@@ -926,6 +1014,7 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
           <select value={status} onChange={(e) => setStatus(e.target.value as DiscrepancyStatus | "")} className={select}>
             <option value="">All statuses</option>
             <option value="UNRESOLVED">Unresolved</option>
+            <option value="PENDING_APPROVAL">Pending approval</option>
             <option value="RESOLVED">Resolved</option>
           </select>
           <select value={issue} onChange={(e) => setIssue(e.target.value as IssueType | "")} className={select}>
@@ -948,6 +1037,7 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
       }
     >
       {error && <p className="mb-3 rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
+      {notice && <p className="mb-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-200">{notice}</p>}
       <div className="-mx-5 overflow-x-auto">
         <table className="w-full min-w-[860px] text-sm">
           <thead>
@@ -997,7 +1087,9 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
                           <ConfidenceMeter value={d.ai_confidence_score} />
                         </td>
                         <td className="px-5 py-2.5 text-right">
-                          {d.status === "RESOLVED" ? (
+                          {d.status === "PENDING_APPROVAL" ? (
+                            <Badge className={TONE.amber}>Awaiting checker</Badge>
+                          ) : d.status === "RESOLVED" ? (
                             <Badge className="text-emerald-300 bg-emerald-500/10 ring-emerald-500/30">{d.auto_resolved ? "Auto-healed" : "Resolved"}</Badge>
                           ) : canResolve ? (
                             <button
@@ -1062,11 +1154,379 @@ function TrackingMatrix({ token, currency, refreshKey, canResolve, onChanged }: 
 /* ============================================================================
  * Chat-with-your-Ledger console
  * ========================================================================== */
+/* ============================================================================
+ * Maker-checker approvals inbox + policy
+ * ========================================================================== */
+const MODE_LABEL: Record<AutoHealMode, string> = {
+  AUTO: "AI fixes post immediately",
+  THRESHOLD: "AI fixes post up to a limit, larger ones need a checker",
+  ALWAYS_APPROVE: "Every AI fix needs a checker",
+};
+
+function PolicyEditor({ token, canEdit, currency }: { token: string; canEdit: boolean; currency: string }) {
+  const [policy, setPolicy] = useState<ApprovalPolicy | null>(null);
+  const [draft, setDraft] = useState<ApprovalPolicy | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    api<ApprovalPolicy>("/api/v1/approval-policy", token)
+      .then((p) => {
+        setPolicy(p);
+        setDraft(p);
+      })
+      .catch((e: unknown) => setMessage(e instanceof Error ? e.message : "Failed to load policy"));
+  }, [token]);
+
+  async function save() {
+    if (!draft) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      const saved = await api<ApprovalPolicy>("/api/v1/approval-policy", token, {
+        method: "PUT",
+        body: JSON.stringify({
+          auto_heal_mode: draft.auto_heal_mode,
+          auto_heal_max_amount: String(draft.auto_heal_max_amount || 0),
+          manual_requires_approval: draft.manual_requires_approval,
+          manual_auto_approve_max: String(draft.manual_auto_approve_max || 0),
+        }),
+      });
+      setPolicy(saved);
+      setDraft(saved);
+      setMessage("Policy saved. It applies from the next reconciliation and resolution.");
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!policy || !draft) return message ? <p className="text-xs text-rose-300">{message}</p> : <Skeleton className="h-16" />;
+  const input = "rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-emerald-500 disabled:opacity-60";
+  return (
+    <div className="rounded-xl border border-ink-700 bg-ink-850/60 p-4 text-xs">
+      <div className="grid gap-3 md:grid-cols-2">
+        <label className="flex flex-col gap-1">
+          <span className="text-slate-400">AI Auto-Healer</span>
+          <select disabled={!canEdit} value={draft.auto_heal_mode} onChange={(e) => setDraft({ ...draft, auto_heal_mode: e.target.value as AutoHealMode })} className={input}>
+            {(Object.keys(MODE_LABEL) as AutoHealMode[]).map((m) => (
+              <option key={m} value={m}>
+                {MODE_LABEL[m]}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-slate-400">AI auto-post limit ({currency})</span>
+          <input
+            disabled={!canEdit || draft.auto_heal_mode !== "THRESHOLD"}
+            type="number"
+            min={0}
+            step="0.01"
+            value={String(draft.auto_heal_max_amount)}
+            onChange={(e) => setDraft({ ...draft, auto_heal_max_amount: e.target.value })}
+            className={input}
+          />
+        </label>
+        <label className="flex items-center gap-2 text-slate-300">
+          <input
+            disabled={!canEdit}
+            type="checkbox"
+            checked={draft.manual_requires_approval}
+            onChange={(e) => setDraft({ ...draft, manual_requires_approval: e.target.checked })}
+            className="h-4 w-4 accent-emerald-500"
+          />
+          Manual resolutions need a second person
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-slate-400">Manual auto-approve limit ({currency})</span>
+          <input
+            disabled={!canEdit || !draft.manual_requires_approval}
+            type="number"
+            min={0}
+            step="0.01"
+            value={String(draft.manual_auto_approve_max)}
+            onChange={(e) => setDraft({ ...draft, manual_auto_approve_max: e.target.value })}
+            className={input}
+          />
+        </label>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-slate-500">
+        <span>
+          {policy.updated_by_email ? `Last changed by ${policy.updated_by_email} ${timeAgo(policy.updated_at)}` : "Default policy"}
+          {canEdit ? "" : " · only owners and admins can change it"}
+        </span>
+        {canEdit && (
+          <button onClick={() => void save()} disabled={saving} className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1 font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-60">
+            {saving && <Spinner className="h-3 w-3" />} Save policy
+          </button>
+        )}
+      </div>
+      {message && <p className="mt-2 text-slate-300">{message}</p>}
+    </div>
+  );
+}
+
+function ApprovalsInbox({
+  token,
+  currency,
+  refreshKey,
+  canApprove,
+  canEditPolicy,
+  onChanged,
+}: {
+  token: string;
+  currency: string;
+  refreshKey: number;
+  canApprove: boolean;
+  canEditPolicy: boolean;
+  onChanged: () => void;
+}) {
+  const [status, setStatus] = useState<RequestStatus>("PENDING");
+  const [maker, setMaker] = useState<"" | "AI" | "USER">("");
+  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState<ApprovalPageData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [showPolicy, setShowPolicy] = useState(false);
+  const limit = 10;
+
+  useEffect(() => {
+    setOffset(0);
+    setSelected(new Set());
+  }, [status, maker]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const params = new URLSearchParams({ status, limit: String(limit), offset: String(offset) });
+    if (maker) params.set("proposed_by_type", maker);
+    setLoading(true);
+    api<ApprovalPageData>(`/api/v1/approvals?${params.toString()}`, token)
+      .then((p) => {
+        if (!cancelled) {
+          setPage(p);
+          setError(null);
+        }
+      })
+      .catch((e: unknown) => !cancelled && setError(e instanceof Error ? e.message : "Failed to load approvals"))
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [token, status, maker, offset, refreshKey]);
+
+  async function act(r: ApprovalRequest, action: "approve" | "reject" | "withdraw") {
+    let body: string | undefined;
+    if (action === "reject") {
+      const reason = window.prompt(`Why reject the fix for ${r.source_order_number}?`, "");
+      if (!reason || !reason.trim()) return;
+      body = JSON.stringify({ note: reason.trim() });
+    } else if (action === "approve") {
+      body = JSON.stringify({});
+    }
+    setBusy(r.request_id);
+    setError(null);
+    try {
+      await api(`/api/v1/approvals/${r.request_id}/${action}`, token, { method: "POST", body });
+      setNotice(`${r.source_order_number}: ${action === "approve" ? "approved" : action === "reject" ? "rejected and reopened" : "withdrawn"}.`);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Action failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function approveSelected() {
+    if (selected.size === 0) return;
+    setBusy("bulk");
+    setError(null);
+    try {
+      const result = await api<BulkResult>("/api/v1/approvals/bulk-approve", token, {
+        method: "POST",
+        body: JSON.stringify({ request_ids: Array.from(selected) }),
+      });
+      const failed = Object.keys(result.failed).length;
+      setNotice(`${result.approved.length} approved${failed ? `, ${failed} skipped (${Object.values(result.failed)[0]})` : ""}.`);
+      setSelected(new Set());
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Bulk approval failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const items = page?.items ?? [];
+  const selectable = items.filter((r) => r.status === "PENDING" && canApprove && !r.is_mine);
+  const allSelected = selectable.length > 0 && selectable.every((r) => selected.has(r.request_id));
+  const select = "rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-emerald-500";
+  const smallButton = "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] disabled:opacity-50";
+
+  return (
+    <Card
+      title="Approvals · Maker-Checker"
+      action={
+        <div className="flex flex-wrap items-center gap-2">
+          {page && status === "PENDING" && (
+            <Badge className={TONE.amber}>
+              {integer(page.total)} pending · {money(page.pending_value, currency, true)}
+            </Badge>
+          )}
+          <select value={status} onChange={(e) => setStatus(e.target.value as RequestStatus)} className={select}>
+            <option value="PENDING">Pending</option>
+            <option value="APPROVED">Approved</option>
+            <option value="REJECTED">Rejected</option>
+            <option value="WITHDRAWN">Withdrawn</option>
+          </select>
+          <select value={maker} onChange={(e) => setMaker(e.target.value as "" | "AI" | "USER")} className={select}>
+            <option value="">AI and people</option>
+            <option value="AI">AI Auto-Healer</option>
+            <option value="USER">People</option>
+          </select>
+          <button onClick={() => setShowPolicy(!showPolicy)} className="rounded-lg border border-ink-600 px-2.5 py-1.5 text-xs text-slate-300 hover:border-slate-400">
+            {showPolicy ? "Hide policy" : "Policy"}
+          </button>
+        </div>
+      }
+    >
+      {showPolicy && (
+        <div className="mb-4">
+          <PolicyEditor token={token} canEdit={canEditPolicy} currency={currency} />
+        </div>
+      )}
+      {!canApprove && status === "PENDING" && (
+        <p className="mb-3 text-xs text-slate-500">Your role can propose fixes; an owner, admin or auditor approves them.</p>
+      )}
+      {error && <p className="mb-3 rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
+      {notice && <p className="mb-3 rounded-md bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">{notice}</p>}
+      {selectable.length > 0 && (
+        <div className="mb-3 flex items-center justify-between text-xs text-slate-400">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={() => setSelected(allSelected ? new Set() : new Set(selectable.map((r) => r.request_id)))}
+              className="h-4 w-4 accent-emerald-500"
+            />
+            Select all on this page
+          </label>
+          <button
+            onClick={() => void approveSelected()}
+            disabled={selected.size === 0 || busy === "bulk"}
+            className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1 font-semibold text-ink-950 hover:bg-emerald-400 disabled:opacity-50"
+          >
+            {busy === "bulk" && <Spinner className="h-3 w-3" />} Approve selected ({selected.size})
+          </button>
+        </div>
+      )}
+      {loading && !page ? (
+        <div className="space-y-2">
+          {[0, 1, 2].map((i) => (
+            <Skeleton key={i} className="h-12" />
+          ))}
+        </div>
+      ) : items.length === 0 ? (
+        <p className="py-6 text-center text-sm text-slate-500">
+          {status === "PENDING" ? "Nothing is waiting for approval." : `No ${status.toLowerCase()} requests.`}
+        </p>
+      ) : (
+        <ul className={`divide-y divide-ink-700 ${loading ? "opacity-60" : ""}`}>
+          {items.map((r) => {
+            const open = expanded === r.request_id;
+            const canSelect = r.status === "PENDING" && canApprove && !r.is_mine;
+            return (
+              <li key={r.request_id} className="py-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  {canSelect ? (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${r.source_order_number}`}
+                      checked={selected.has(r.request_id)}
+                      onChange={() => {
+                        const next = new Set(selected);
+                        if (next.has(r.request_id)) next.delete(r.request_id);
+                        else next.add(r.request_id);
+                        setSelected(next);
+                      }}
+                      className="h-4 w-4 accent-emerald-500"
+                    />
+                  ) : (
+                    <span className="w-4" />
+                  )}
+                  <button onClick={() => setExpanded(open ? null : r.request_id)} className="min-w-0 flex-1 text-left">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-xs text-slate-200">{r.source_order_number}</span>
+                      <Badge className={ISSUE_META[r.issue_type].tone}>{ISSUE_META[r.issue_type].label}</Badge>
+                      {r.root_cause_category && <span className="text-xs text-slate-400">{humanize(r.root_cause_category)}</span>}
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {r.proposed_by_type === "AI" ? "AI Auto-Healer" : r.is_mine ? "You" : r.proposed_by_email} proposed {timeAgo(r.created_at)}
+                      {r.maker_note ? ` · “${r.maker_note}”` : ""}
+                      {r.decided_by_email ? ` · ${r.status.toLowerCase()} by ${r.decided_by_email === "policy:auto" ? "policy" : r.decided_by_email}` : ""}
+                      {r.checker_note ? ` · “${r.checker_note}”` : ""}
+                    </p>
+                  </button>
+                  <span className="tabular text-sm font-medium text-slate-100">{money(r.amount, currency)}</span>
+                  {r.status === "PENDING" && (
+                    <div className="flex items-center gap-1.5">
+                      {r.is_mine ? (
+                        <button onClick={() => void act(r, "withdraw")} disabled={busy === r.request_id} className={`${smallButton} border-ink-600 text-slate-300 hover:border-slate-400`}>
+                          Withdraw
+                        </button>
+                      ) : canApprove ? (
+                        <>
+                          <button onClick={() => void act(r, "approve")} disabled={busy === r.request_id} className={`${smallButton} border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10`}>
+                            {busy === r.request_id && <Spinner className="h-3 w-3" />} Approve
+                          </button>
+                          <button onClick={() => void act(r, "reject")} disabled={busy === r.request_id} className={`${smallButton} border-rose-500/40 text-rose-300 hover:bg-rose-500/10`}>
+                            Reject
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+                {open && (
+                  <div className="mt-3 rounded-xl bg-ink-950/60 p-4">
+                    <PanelBoundary title="Proposed fix">
+                      <FixPreview fix={r.proposed_fix} currency={currency} />
+                    </PanelBoundary>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {page && page.total > limit && (
+        <footer className="mt-3 flex items-center justify-end gap-2 text-xs text-slate-500">
+          <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - limit))} className="rounded-md border border-ink-600 px-2.5 py-1 hover:text-slate-200 disabled:opacity-40">
+            Prev
+          </button>
+          <span className="tabular">
+            {Math.floor(offset / limit) + 1} / {Math.ceil(page.total / limit)}
+          </span>
+          <button disabled={offset + limit >= page.total} onClick={() => setOffset(offset + limit)} className="rounded-md border border-ink-600 px-2.5 py-1 hover:text-slate-200 disabled:opacity-40">
+            Next
+          </button>
+        </footer>
+      )}
+    </Card>
+  );
+}
+
 const SUGGESTIONS = [
   "What is our total open revenue leakage by issue type?",
   "Which findings did the auto-healer resolve and how much value?",
   "Which courier owes us the most COD?",
   "Which payouts never reached the bank?",
+  "What is waiting for approval?",
 ];
 
 function ResultTable({ answer }: { answer: AgentAnswer }) {
@@ -1359,6 +1819,8 @@ export default function DashboardPage() {
   const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
   const canWrite = useMemo(() => !!session && ["OWNER", "ADMIN", "ANALYST"].includes(session.role), [session]);
   const canResolve = useMemo(() => canWrite || session?.role === "AUDITOR", [canWrite, session]);
+  const canApprove = useMemo(() => !!session && ["OWNER", "ADMIN", "AUDITOR"].includes(session.role), [session]);
+  const canEditPolicy = useMemo(() => !!session && ["OWNER", "ADMIN"].includes(session.role), [session]);
 
   if (!hydrated) return null;
   if (!session) {
@@ -1418,6 +1880,16 @@ export default function DashboardPage() {
           </div>
           <PanelBoundary title="Courier ledger">
             <CourierLedger metrics={metrics} loading={loading && !metrics} />
+          </PanelBoundary>
+          <PanelBoundary title="Approvals">
+            <ApprovalsInbox
+              token={session.token}
+              currency={currency}
+              refreshKey={refreshKey}
+              canApprove={canApprove}
+              canEditPolicy={canEditPolicy}
+              onChanged={refresh}
+            />
           </PanelBoundary>
           <PanelBoundary title="Tracking matrix">
             <TrackingMatrix token={session.token} currency={currency} refreshKey={refreshKey} canResolve={canResolve} onChanged={refresh} />

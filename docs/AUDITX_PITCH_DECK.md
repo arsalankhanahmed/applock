@@ -194,11 +194,13 @@ overdue. Nothing here is auto-resolved: every finding is money to recover, so yo
 | Charged twice | `DUPLICATE_CAPTURE` | 88% | Refund (human approval) |
 | Variance ≥ 20% of order | `POTENTIAL_FRAUD_OR_MANIPULATION` | escalated | Forensic review |
 
-*Demo benchmark:* **46% of gateway breaks auto-healed**, each with gateway API evidence and a balanced journal entry.
-Bank charges deducted from deposits heal the same way. Courier claims always go to a person.
+*Demo benchmark:* **46% of gateway breaks get an AI fix**, each with gateway API evidence and a balanced journal entry.
+Under the default maker-checker policy, sub-$1 rounding posts instantly and the rest wait for one-click checker
+approval (single or bulk). Courier claims always go to a person.
 
 **Script:**
-"Low-risk, high-confidence patterns are resolved autonomously, and every resolution carries the evidence trail,
+"Low-risk, high-confidence patterns get a ready-made fix; your approval policy decides what posts by itself
+and what waits for a checker's one-click approval. Every resolution carries the evidence trail,
 the confidence score and the double-entry journal it proposes. Anything touching customer money, such as refunds or
 suspected manipulation, is never auto-resolved. It goes to a human with the work already done."
 
@@ -284,7 +286,7 @@ Your first reconciliation report will be in your inbox within a week."
 | Objection | Response |
 |-----------|----------|
 | "Our ERP already reconciles." | "It reconciles to the bank in totals. AuditX reconciles every order to every capture, which is where offsetting errors hide." |
-| "We can't let AI change our books." | "AuditX proposes journal entries with evidence. Auto-resolution covers only low-risk categories you approve, and everything is logged and reversible." |
+| "We can't let AI change our books." | "It can't on its own. Maker-checker is built in: the AI and your analysts propose, a second person approves, and the maker can never approve their own fix. You set the limit below which anything may post automatically, and every step is logged." |
 | "Data security?" | "Tenant isolation at the database layer, read-only AI sandbox, no write access to your ERP, data stays in your chosen region." |
 | "Integration effort?" | "CSV exports you already produce. Mapping is a one-time 30-minute session per source." |
 | "We tried a reconciliation tool before." | "Totals-matching tools miss order-level breaks and stop at flagging. AuditX classifies, explains and fixes." |

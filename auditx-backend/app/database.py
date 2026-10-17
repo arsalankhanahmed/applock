@@ -95,14 +95,13 @@ CREATE TABLE IF NOT EXISTS discrepancy_logs (
     order_amount            NUMERIC(18, 2),
     gateway_amount          NUMERIC(18, 2),
     variance_amount         NUMERIC(18, 2) NOT NULL,
-    status                  VARCHAR(16) NOT NULL DEFAULT 'UNRESOLVED' CHECK (status IN ('UNRESOLVED', 'RESOLVED')),
+    status                  VARCHAR(16) NOT NULL DEFAULT 'UNRESOLVED',
     ai_root_cause_category  VARCHAR(64),
     ai_confidence_score     NUMERIC(5, 4) CHECK (ai_confidence_score IS NULL OR ai_confidence_score BETWEEN 0 AND 1),
     ai_suggested_fix        JSONB,
     auto_resolved           BOOLEAN NOT NULL DEFAULT FALSE,
     detected_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at             TIMESTAMPTZ,
-    CONSTRAINT ck_resolution_timestamp CHECK (status = 'UNRESOLVED' OR resolved_at IS NOT NULL)
+    resolved_at             TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS ix_discrepancy_org_status ON discrepancy_logs (org_id, status, issue_type);
 CREATE INDEX IF NOT EXISTS ix_discrepancy_org_order ON discrepancy_logs (org_id, source_order_number);
@@ -177,6 +176,55 @@ ALTER TABLE discrepancy_logs ADD CONSTRAINT ck_discrepancy_issue_type CHECK (iss
     'SETTLEMENT_NOT_DEPOSITED', 'DEPOSIT_MISMATCH', 'UNMATCHED_DEPOSIT',
     'COD_PARCEL_UNTRACKED', 'COD_ORDER_NOT_BOOKED', 'COD_NOT_REMITTED', 'COD_REMITTANCE_SHORTFALL',
     'COURIER_OVERCHARGE', 'RETURNED_ORDER_BOOKED', 'PARCEL_LOST_OR_STUCK'));
+
+ALTER TABLE discrepancy_logs DROP CONSTRAINT IF EXISTS discrepancy_logs_status_check;
+ALTER TABLE discrepancy_logs DROP CONSTRAINT IF EXISTS ck_discrepancy_status;
+ALTER TABLE discrepancy_logs ADD CONSTRAINT ck_discrepancy_status
+    CHECK (status IN ('UNRESOLVED', 'PENDING_APPROVAL', 'RESOLVED'));
+ALTER TABLE discrepancy_logs DROP CONSTRAINT IF EXISTS ck_resolution_timestamp;
+ALTER TABLE discrepancy_logs ADD CONSTRAINT ck_resolution_timestamp
+    CHECK (status <> 'RESOLVED' OR resolved_at IS NOT NULL);
+
+-- Maker-checker: every resolution (AI or human) is a request; a different person approves it.
+-- The finding is snapshotted so the trail survives reconciliation rebuilding open findings.
+CREATE TABLE IF NOT EXISTS resolution_requests (
+    request_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    org_id               UUID NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    log_id               UUID REFERENCES discrepancy_logs(log_id) ON DELETE SET NULL,
+    source_order_number  VARCHAR(128) NOT NULL,
+    issue_type           VARCHAR(32) NOT NULL,
+    channel              VARCHAR(16) NOT NULL,
+    amount               NUMERIC(18, 2) NOT NULL,
+    root_cause_category  VARCHAR(64),
+    proposed_fix         JSONB,
+    proposed_by_type     VARCHAR(8) NOT NULL CHECK (proposed_by_type IN ('AI', 'USER')),
+    proposed_by          UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    proposed_by_email    VARCHAR(320),
+    maker_note           TEXT,
+    status               VARCHAR(16) NOT NULL DEFAULT 'PENDING'
+                         CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED', 'WITHDRAWN')),
+    decided_by           UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    decided_by_email     VARCHAR(320),
+    checker_note         TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at           TIMESTAMPTZ,
+    CONSTRAINT ck_request_decision CHECK (status IN ('PENDING') OR decided_at IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_one_pending_request_per_log
+    ON resolution_requests (log_id) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS ix_requests_org_status ON resolution_requests (org_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_requests_org_key ON resolution_requests (org_id, source_order_number, issue_type);
+
+CREATE TABLE IF NOT EXISTS approval_policies (
+    org_id                    UUID PRIMARY KEY REFERENCES organizations(org_id) ON DELETE CASCADE,
+    auto_heal_mode            VARCHAR(16) NOT NULL DEFAULT 'THRESHOLD'
+                              CHECK (auto_heal_mode IN ('AUTO', 'THRESHOLD', 'ALWAYS_APPROVE')),
+    auto_heal_max_amount      NUMERIC(18, 2) NOT NULL DEFAULT 1.00 CHECK (auto_heal_max_amount >= 0),
+    manual_requires_approval  BOOLEAN NOT NULL DEFAULT TRUE,
+    manual_auto_approve_max   NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (manual_auto_approve_max >= 0),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by_email          VARCHAR(320)
+);
 
 ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS audit_jobs_job_type_check;
 ALTER TABLE audit_jobs DROP CONSTRAINT IF EXISTS ck_audit_job_type;

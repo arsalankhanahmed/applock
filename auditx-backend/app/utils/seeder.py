@@ -140,6 +140,12 @@ class Settlement:
             self.closed_at = moment
 
 
+def checker_email(email: str) -> str:
+    """The AUDITOR login seeded next to the owner, so maker-checker can be exercised: demo@x -> demo+checker@x."""
+    local, _, domain = email.partition("@")
+    return f"{local}+checker@{domain}"
+
+
 def ensure_tenant(company_name: str, currency: str, org_id: Optional[str], email: str, password: str) -> Tuple[UUID, bool]:
     from app.main import hash_password
 
@@ -161,6 +167,11 @@ def ensure_tenant(company_name: str, currency: str, org_id: Optional[str], email
                 text("INSERT INTO users (org_id, full_name, email, password_hash, role) "
                      "VALUES (:o, 'Demo Controller', lower(:e), :p, 'OWNER')"),
                 {"o": str(org), "e": email, "p": hash_password(password)},
+            )
+            conn.execute(
+                text("INSERT INTO users (org_id, full_name, email, password_hash, role) "
+                     "VALUES (:o, 'Demo Auditor', lower(:e), :p, 'AUDITOR') ON CONFLICT (email) DO NOTHING"),
+                {"o": str(org), "e": checker_email(email), "p": hash_password(password)},
             )
             created_user = True
         fields = conn.execute(
@@ -609,7 +620,8 @@ def run(args: argparse.Namespace) -> SeedStats:
     print(f"  bank anomalies       : {sum(stats.bank_anomalies.values()):,} {stats.bank_anomalies}")
     print(f"  elapsed              : {elapsed:.2f}s")
     if created_user:
-        print(f"  login                : {args.email} / {args.password}")
+        print(f"  login (maker/owner)  : {args.email} / {args.password}")
+        print(f"  login (checker)      : {checker_email(args.email)} / {args.password}  (AUDITOR)")
     else:
         print(f"  login                : {args.email} already exists (belongs to its original org; pass --email)")
     if args.export_csv:

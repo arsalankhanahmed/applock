@@ -75,7 +75,7 @@ TABLE discrepancy_logs (
   , order_amount NUMERIC  -- expected amount
   , gateway_amount NUMERIC  -- received amount
   , variance_amount NUMERIC  -- expected - received; positive = revenue leakage
-  , status VARCHAR  -- 'UNRESOLVED' or 'RESOLVED'
+  , status VARCHAR  -- 'UNRESOLVED', 'PENDING_APPROVAL' or 'RESOLVED'
   , ai_root_cause_category VARCHAR  -- e.g. FX_ROUNDING_ERROR, PROMO_CODE_UNSYNCED, GATEWAY_FEE_NETTING,
                                     -- ORDER_ID_FORMAT_DRIFT, PAYMENT_NOT_CAPTURED, ORPHAN_GATEWAY_PAYMENT,
                                     -- DUPLICATE_CAPTURE, POTENTIAL_FRAUD_OR_MANIPULATION, UNEXPLAINED_VARIANCE,
@@ -86,6 +86,13 @@ TABLE discrepancy_logs (
   , ai_confidence_score NUMERIC, ai_suggested_fix JSONB, auto_resolved BOOLEAN,
   detected_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ
 )
+TABLE resolution_requests (
+  request_id UUID, org_id UUID, log_id UUID, source_order_number VARCHAR, issue_type VARCHAR, channel VARCHAR,
+  amount NUMERIC, root_cause_category VARCHAR,
+  proposed_by_type VARCHAR  -- 'AI' (Auto-Healer) or 'USER'
+  , status VARCHAR  -- 'PENDING','APPROVED','REJECTED','WITHDRAWN'
+  , created_at TIMESTAMPTZ, decided_at TIMESTAMPTZ
+)  -- maker-checker approval requests for resolving discrepancy_logs (status 'PENDING_APPROVAL' while queued)
 TABLE organizations (org_id UUID, company_name VARCHAR, brand_currency VARCHAR(3), created_at TIMESTAMPTZ)
 """.strip()
 
@@ -152,6 +159,11 @@ TENANT_VIEWS = {
     "discrepancy_logs": "SELECT * FROM public.discrepancy_logs WHERE org_id = '{org}'",
     "bank_transactions": "SELECT * FROM public.bank_transactions WHERE org_id = '{org}'",
     "courier_remittances": "SELECT * FROM public.courier_remittances WHERE org_id = '{org}'",
+    "resolution_requests": (
+        "SELECT request_id, org_id, log_id, source_order_number, issue_type, channel, amount, root_cause_category, "
+        "proposed_by_type, status, created_at, decided_at FROM public.resolution_requests WHERE org_id = '{org}'"
+    ),
+    "approval_policies": "SELECT NULL::uuid AS org_id WHERE FALSE",
     "users": "SELECT NULL::uuid AS user_id, NULL::uuid AS org_id WHERE FALSE",
     "client_field_mappings": "SELECT NULL::uuid AS mapping_id, NULL::uuid AS org_id WHERE FALSE",
     "audit_jobs": "SELECT NULL::uuid AS job_id, NULL::uuid AS org_id WHERE FALSE",
@@ -269,6 +281,14 @@ def _llm_narrative(question: str, sql: str, frame: pd.DataFrame) -> str:
 
 _INTENTS: List[Tuple[re.Pattern, str, str]] = [
     (
+        re.compile(r"(approv|pending|checker|maker|sign[- ]?off|queue)", re.I),
+        "Resolution requests waiting for a checker, by who proposed them and root cause.",
+        """SELECT r.proposed_by_type, r.root_cause_category AS root_cause, COUNT(*) AS pending_requests,
+                  ROUND(SUM(r.amount), 2) AS pending_value, MIN(r.created_at) AS oldest_request
+             FROM resolution_requests r WHERE r.org_id = :org_id AND r.status = 'PENDING'
+            GROUP BY r.proposed_by_type, r.root_cause_category ORDER BY pending_value DESC LIMIT 50""",
+    ),
+    (
         re.compile(r"(courier|cod\b|cash on delivery|remit|rider|tcs|leopards|postex|trax)", re.I),
         "Cash owed by each courier: delivered COD not yet remitted, charges and returns.",
         """SELECT c.courier_name, COUNT(*) FILTER (WHERE c.parcel_status = 'DELIVERED') AS delivered,
@@ -374,7 +394,7 @@ def _heuristic_generate_sql(question: str) -> Tuple[str, str]:
 def _heuristic_narrative(frame: pd.DataFrame, explanation: str) -> str:
     if frame.empty:
         return f"{explanation} No matching records were found for your organisation."
-    preference = ["leakage", "pending_remittance", "exposure", "value_healed", "variance_amount", "gross", "fees",
+    preference = ["leakage", "pending_value", "pending_remittance", "exposure", "value_healed", "variance_amount", "gross", "fees",
                   "order_amount", "gateway_amount"]
     money_cols = [c for c in preference if c in frame.columns]
     summary = f"{explanation} Returned {len(frame)} row(s)."

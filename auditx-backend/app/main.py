@@ -30,12 +30,15 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.config import settings
 from app.database import engine, init_db
-from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, Channel, CurrentUser, DashboardMetrics,
+from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, ApprovalPage, ApprovalPolicyIn,
+                                ApprovalPolicyOut, ApprovalRequestOut, BulkDecisionRequest, BulkDecisionResult,
+                                Channel, CurrentUser, DashboardMetrics, DecisionRequest, RequestStatus, UserCreate,
+                                UserOut,
                                 DataDictionaryField, DiscrepancyOut, DiscrepancyPage, DiscrepancyStatus,
                                 FieldMappingBulkIn, FieldMappingOut, IngestTarget, IssueType, JobAccepted,
                                 JobOut, JobStatus, JobType, LoginRequest, ManualResolveRequest,
                                 ReconciliationRequest, RegisterRequest, TokenResponse, UserRole)
-from app.services import ai_agent
+from app.services import ai_agent, approvals
 from app.workers.tasks import ingest_file, run_reconciliation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -170,6 +173,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(approvals.ApprovalError)
+async def approval_error_handler(_: Request, exc: approvals.ApprovalError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
 @app.exception_handler(ai_agent.UnsafeQueryError)
@@ -431,29 +439,151 @@ async def list_discrepancies(
 async def resolve_discrepancy(
     log_id: UUID, body: ManualResolveRequest, user: CurrentUser = Depends(require_roles(*WRITE_ROLES, UserRole.AUDITOR))
 ) -> Dict[str, Any]:
-    resolution = {
-        "manual_resolution": {
-            "note": body.resolution_note,
-            "resolved_by": user.email,
-            "resolved_at": datetime.now(timezone.utc).isoformat(),
-        }
-    }
-    row = await run_in_threadpool(
-        _execute,
-        """
-        UPDATE discrepancy_logs
-           SET status = 'RESOLVED',
-               resolved_at = now(),
-               auto_resolved = FALSE,
-               ai_root_cause_category = COALESCE(:c, ai_root_cause_category),
-               ai_suggested_fix = COALESCE(ai_suggested_fix, '{}'::jsonb) || CAST(:fix AS jsonb)
-         WHERE log_id = :l AND org_id = :o AND status = 'UNRESOLVED'
-        RETURNING *
-        """,
-        {"l": str(log_id), "o": str(user.org_id), "c": body.root_cause_category, "fix": json.dumps(resolution)},
+    """Maker step. Under the tenant's approval policy the finding either resolves at once or goes to
+    PENDING_APPROVAL until a different checker approves it."""
+    def submit() -> Dict[str, Any]:
+        with engine.begin() as conn:
+            return approvals.submit_manual_resolution(
+                conn, user.org_id, log_id, user.user_id, user.email, body.resolution_note, body.root_cause_category
+            )
+
+    return await run_in_threadpool(submit)
+
+
+# ----------------------------------------------------------------------------- maker-checker approvals
+_REQUEST_COLUMNS = """request_id, log_id, source_order_number, issue_type, channel, amount, root_cause_category,
+                      proposed_fix, proposed_by_type, proposed_by_email, maker_note, status, decided_by_email,
+                      checker_note, created_at, decided_at, (proposed_by IS NOT NULL AND proposed_by = :u) AS is_mine"""
+
+
+@app.get(f"{P}/approvals", response_model=ApprovalPage, tags=["approvals"])
+async def list_approvals(
+    status_filter: RequestStatus = Query(RequestStatus.PENDING, alias="status"),
+    proposed_by_type: Optional[str] = Query(None, pattern="^(AI|USER)$"),
+    limit: int = Query(25, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    user: CurrentUser = Depends(current_user),
+) -> ApprovalPage:
+    clauses = ["org_id = :o", "status = :s"]
+    params: Dict[str, Any] = {"o": str(user.org_id), "s": status_filter.value, "u": str(user.user_id),
+                              "l": limit, "off": offset}
+    if proposed_by_type:
+        clauses.append("proposed_by_type = :t")
+        params["t"] = proposed_by_type
+    where = " AND ".join(clauses)
+    order = "created_at ASC" if status_filter == RequestStatus.PENDING else "decided_at DESC NULLS LAST"
+
+    def query() -> ApprovalPage:
+        with engine.connect() as conn:
+            head = conn.execute(
+                text(f"SELECT COUNT(*) AS total, COALESCE(SUM(amount), 0) AS value FROM resolution_requests WHERE {where}"),
+                params,
+            ).mappings().one()
+            rows = conn.execute(
+                text(f"SELECT {_REQUEST_COLUMNS} FROM resolution_requests WHERE {where} "
+                     f"ORDER BY {order} LIMIT :l OFFSET :off"),
+                params,
+            ).mappings().all()
+        return ApprovalPage(total=head["total"], pending_value=head["value"], limit=limit, offset=offset,
+                            items=[ApprovalRequestOut(**r) for r in rows])
+
+    return await run_in_threadpool(query)
+
+
+def _decide(user: CurrentUser, request_id: UUID, approve: bool, note: Optional[str]) -> Dict[str, Any]:
+    with engine.begin() as conn:
+        approvals.decide(conn, user.org_id, request_id, user.user_id, user.email, user.role.value, approve, note)
+        return dict(conn.execute(
+            text(f"SELECT {_REQUEST_COLUMNS} FROM resolution_requests WHERE request_id = :r"),
+            {"r": str(request_id), "u": str(user.user_id)},
+        ).mappings().one())
+
+
+@app.post(f"{P}/approvals/{{request_id}}/approve", response_model=ApprovalRequestOut, tags=["approvals"])
+async def approve_request(request_id: UUID, body: DecisionRequest = DecisionRequest(),
+                          user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    return await run_in_threadpool(_decide, user, request_id, True, body.note)
+
+
+@app.post(f"{P}/approvals/{{request_id}}/reject", response_model=ApprovalRequestOut, tags=["approvals"])
+async def reject_request(request_id: UUID, body: DecisionRequest, user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    return await run_in_threadpool(_decide, user, request_id, False, body.note)
+
+
+@app.post(f"{P}/approvals/{{request_id}}/withdraw", response_model=ApprovalRequestOut, tags=["approvals"])
+async def withdraw_request(request_id: UUID, user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    def run() -> Dict[str, Any]:
+        with engine.begin() as conn:
+            approvals.withdraw(conn, user.org_id, request_id, user.user_id)
+            return dict(conn.execute(
+                text(f"SELECT {_REQUEST_COLUMNS} FROM resolution_requests WHERE request_id = :r"),
+                {"r": str(request_id), "u": str(user.user_id)},
+            ).mappings().one())
+
+    return await run_in_threadpool(run)
+
+
+@app.post(f"{P}/approvals/bulk-approve", response_model=BulkDecisionResult, tags=["approvals"])
+async def bulk_approve(body: BulkDecisionRequest, user: CurrentUser = Depends(current_user)) -> BulkDecisionResult:
+    """Approve many requests; each is decided in its own transaction and checked on its own."""
+    def run() -> BulkDecisionResult:
+        approved: List[UUID] = []
+        failed: Dict[str, str] = {}
+        for request_id in dict.fromkeys(body.request_ids):
+            try:
+                with engine.begin() as conn:
+                    approvals.decide(conn, user.org_id, request_id, user.user_id, user.email, user.role.value,
+                                     True, body.note)
+                approved.append(request_id)
+            except approvals.ApprovalError as exc:
+                failed[str(request_id)] = str(exc)
+        return BulkDecisionResult(approved=approved, failed=failed)
+
+    return await run_in_threadpool(run)
+
+
+@app.get(f"{P}/approval-policy", response_model=ApprovalPolicyOut, tags=["approvals"])
+async def get_approval_policy(user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    def load() -> Dict[str, Any]:
+        with engine.connect() as conn:
+            return approvals.load_policy(conn, user.org_id).as_dict()
+
+    return await run_in_threadpool(load)
+
+
+@app.put(f"{P}/approval-policy", response_model=ApprovalPolicyOut, tags=["approvals"])
+async def put_approval_policy(body: ApprovalPolicyIn, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    def save() -> Dict[str, Any]:
+        with engine.begin() as conn:
+            return approvals.save_policy(conn, user.org_id, body.model_dump(mode="python"), user.email).as_dict()
+
+    return await run_in_threadpool(save)
+
+
+# ----------------------------------------------------------------------------- team members
+@app.get(f"{P}/users", response_model=List[UserOut], tags=["auth"])
+async def list_users(user: CurrentUser = Depends(current_user)) -> List[Dict[str, Any]]:
+    return await run_in_threadpool(
+        _fetch_all, "SELECT user_id, full_name, email, role, created_at FROM users WHERE org_id = :o ORDER BY created_at",
+        {"o": str(user.org_id)},
     )
-    if not row:
-        raise HTTPException(404, "Open discrepancy not found")
+
+
+@app.post(f"{P}/users", response_model=UserOut, status_code=201, tags=["auth"])
+async def create_user(body: UserCreate, user: CurrentUser = Depends(require_roles(*ADMIN_ROLES))) -> Dict[str, Any]:
+    """Add a team member, e.g. an AUDITOR to act as checker. Only an OWNER may create another OWNER."""
+    if body.role == UserRole.OWNER and user.role != UserRole.OWNER:
+        raise HTTPException(403, "Only an owner can add another owner")
+    try:
+        row = await run_in_threadpool(
+            _execute,
+            "INSERT INTO users (org_id, full_name, email, password_hash, role) VALUES (:o, :n, lower(:e), :p, :r) "
+            "RETURNING user_id, full_name, email, role, created_at",
+            {"o": str(user.org_id), "n": body.full_name, "e": body.email, "p": hash_password(body.password),
+             "r": body.role.value},
+        )
+    except IntegrityError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "An account with this email already exists") from exc
     return row
 
 
@@ -476,11 +606,14 @@ WITH o AS (
     SELECT (SELECT COUNT(*) FROM ecom_orders WHERE org_id = :o AND payment_method = 'COD') AS cod_orders,
            (SELECT COALESCE(SUM(cod_amount - delivery_charges), 0) FROM courier_remittances
              WHERE org_id = :o AND parcel_status = 'DELIVERED' AND remittance_reference IS NULL) AS pending
+), r AS (
+    SELECT COUNT(*) AS pending_n, COALESCE(SUM(amount), 0) AS pending_v
+      FROM resolution_requests WHERE org_id = :o AND status = 'PENDING'
 ), d AS (
-    SELECT COUNT(*) FILTER (WHERE status = 'UNRESOLVED') AS open_n,
-           COALESCE(SUM(variance_amount) FILTER (WHERE status = 'UNRESOLVED'
+    SELECT COUNT(*) FILTER (WHERE status <> 'RESOLVED') AS open_n,
+           COALESCE(SUM(variance_amount) FILTER (WHERE status <> 'RESOLVED'
                     AND issue_type = 'SETTLEMENT_NOT_DEPOSITED'), 0) AS not_deposited,
-           COALESCE(SUM(variance_amount) FILTER (WHERE status = 'UNRESOLVED' AND variance_amount > 0), 0) AS leakage,
+           COALESCE(SUM(variance_amount) FILTER (WHERE status <> 'RESOLVED' AND variance_amount > 0), 0) AS leakage,
            COUNT(*) FILTER (WHERE auto_resolved) AS healed_n,
            COALESCE(SUM(ABS(variance_amount)) FILTER (WHERE auto_resolved), 0) AS healed_v,
            COUNT(*) FILTER (WHERE status = 'RESOLVED' AND NOT auto_resolved) AS manual_n,
@@ -497,9 +630,10 @@ SELECT org.company_name, org.brand_currency,
        CASE WHEN d.total_n = 0 THEN 0 ELSE ROUND(100.0 * d.healed_n / d.total_n, 2) END AS auto_heal_rate_pct,
        b.credits AS bank_credits_total, s.expected AS settlements_expected_total,
        d.not_deposited AS settlements_not_deposited, c.cod_orders, c.pending AS cod_pending_remittance,
+       r.pending_n AS pending_approval_count, r.pending_v AS pending_approval_value,
        (SELECT MAX(finished_at) FROM audit_jobs
          WHERE org_id = :o AND job_type = 'RECONCILIATION' AND status = 'SUCCEEDED') AS last_reconciliation_at
-  FROM organizations org, o, g, b, s, c, d
+  FROM organizations org, o, g, b, s, c, r, d
  WHERE org.org_id = :o
 """
 
@@ -514,8 +648,8 @@ _ISSUE_VALUES = ", ".join(f"('{issue}', '{channel}', {i})" for i, (issue, channe
 
 _ISSUE_SQL = f"""
 SELECT t.issue_type, t.channel,
-       COUNT(l.log_id) FILTER (WHERE l.status = 'UNRESOLVED') AS open_count,
-       COALESCE(SUM(ABS(l.variance_amount)) FILTER (WHERE l.status = 'UNRESOLVED'), 0) AS open_exposure,
+       COUNT(l.log_id) FILTER (WHERE l.status <> 'RESOLVED') AS open_count,
+       COALESCE(SUM(ABS(l.variance_amount)) FILTER (WHERE l.status <> 'RESOLVED'), 0) AS open_exposure,
        COUNT(l.log_id) FILTER (WHERE l.status = 'RESOLVED') AS resolved_count
   FROM (VALUES {_ISSUE_VALUES}) AS t(issue_type, channel, pos)
   LEFT JOIN discrepancy_logs l ON l.issue_type = t.issue_type AND l.org_id = :o
@@ -525,8 +659,8 @@ SELECT t.issue_type, t.channel,
 
 _CHANNEL_SQL = """
 SELECT t.channel,
-       COUNT(l.log_id) FILTER (WHERE l.status = 'UNRESOLVED') AS open_count,
-       COALESCE(SUM(ABS(l.variance_amount)) FILTER (WHERE l.status = 'UNRESOLVED'), 0) AS open_exposure,
+       COUNT(l.log_id) FILTER (WHERE l.status <> 'RESOLVED') AS open_count,
+       COALESCE(SUM(ABS(l.variance_amount)) FILTER (WHERE l.status <> 'RESOLVED'), 0) AS open_exposure,
        COUNT(l.log_id) FILTER (WHERE l.status = 'RESOLVED') AS resolved_count
   FROM (VALUES ('GATEWAY', 1), ('BANK', 2), ('COD', 3)) AS t(channel, pos)
   LEFT JOIN discrepancy_logs l ON l.channel = t.channel AND l.org_id = :o

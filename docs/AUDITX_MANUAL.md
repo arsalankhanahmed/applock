@@ -70,6 +70,8 @@ carries `org_id UUID NOT NULL REFERENCES organizations ON DELETE CASCADE`.
 | `bank_transactions` | Bank statement lines (credit positive, debit negative) | `UNIQUE(org_id, bank_reference)`; a stable fingerprint is generated when the bank gives no reference |
 | `courier_remittances` | One row per COD parcel: status, cash collected, charges, net remitted, remittance (CPR) number | `UNIQUE(org_id, tracking_number)`; re-uploads **update** a parcel (latest report wins) |
 | `discrepancy_logs` | Findings + AI verdicts; `channel` = `GATEWAY` / `BANK` / `COD`; `order_amount` = expected, `gateway_amount` = received | `issue_type` / `channel` / `status` checks, `resolved_at` required when resolved |
+| `resolution_requests` | Maker-checker trail: every proposed resolution (AI or person), its decision, maker and checker, notes; the finding is snapshotted so the trail survives reconciliation | one `PENDING` request per finding; `log_id` set to NULL (not deleted) if the finding is rebuilt |
+| `approval_policies` | One row per tenant: what the AI and people may resolve without a checker | mode / amount checks |
 | `audit_jobs` | Tenant-scoped background job ledger | `job_type` / `status` checks |
 
 Enumerations (issue types, job types, dictionary tables) live in named check constraints that the migration
@@ -111,7 +113,13 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | POST | `/reconciliation/run` | `{"auto_heal": true}` → **202 Accepted**; runs all three legs |
 | GET | `/jobs`, `/jobs/{job_id}` | Job status and result payloads |
 | GET | `/discrepancies` | Filters: `status`, `channel`, `issue_type`, `auto_resolved`, `search`, `sort`, `limit`, `offset` |
-| POST | `/discrepancies/{log_id}/resolve` | Manual resolution with audit note |
+| POST | `/discrepancies/{log_id}/resolve` | Maker step: propose a resolution with a note; resolves at once or goes to `PENDING_APPROVAL` per policy |
+| GET | `/approvals` | Approval queue; filters `status` (`PENDING` default), `proposed_by_type` (`AI` / `USER`) |
+| POST | `/approvals/{request_id}/approve` / `reject` | Checker step (OWNER / ADMIN / AUDITOR, never the maker); reject needs a `note` |
+| POST | `/approvals/{request_id}/withdraw` | Maker takes back their own pending request |
+| POST | `/approvals/bulk-approve` | `{"request_ids": [...]}`; each request is checked on its own, failures listed |
+| GET / PUT | `/approval-policy` | Read / change the tenant's approval policy (PUT: OWNER / ADMIN) |
+| GET / POST | `/users` | List team members / add one (OWNER / ADMIN), e.g. an AUDITOR to act as checker |
 | GET | `/dashboard/metrics` | KPIs, per-channel and per-issue exposure, root causes, per-courier COD ledger |
 | POST | `/agent/query` | `{"question": "..."}` → SQL, rows, narrative |
 
@@ -167,6 +175,33 @@ person approves it.
 Timing thresholds are environment settings: `SETTLEMENT_LAG_DAYS` (7), `BANK_MATCH_WINDOW_DAYS` (10),
 `COD_DISPATCH_SLA_DAYS` (7), `COD_REMITTANCE_SLA_DAYS` (10), `PARCEL_STUCK_DAYS` (21),
 `COURIER_OVERCHARGE_RATIO` (1.5).
+
+### 4.4 Maker-checker approvals
+
+No single person, and not the AI, can close a finding that changes the books on their own:
+
+1. **Maker** proposes. A person presses **Resolve** with a note, or the Auto-Healer produces a fix it would
+   apply. A `resolution_requests` row is written and the finding moves to `PENDING_APPROVAL`.
+2. **Checker** decides in the **Approvals** inbox: approve (finding → `RESOLVED`) or reject with a reason
+   (finding → `UNRESOLVED`, reason kept). Checkers are OWNER, ADMIN or AUDITOR; **the maker can never decide
+   their own request**, and only the maker can withdraw it.
+3. Every step is recorded: who proposed, who decided, when, both notes, and the proposed fix itself.
+
+The per-company **approval policy** (Approvals → Policy, owners and admins only) sets what skips the queue:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| AI Auto-Healer mode | `THRESHOLD` | `AUTO`: AI fixes post immediately · `THRESHOLD`: AI fixes up to the limit post, larger ones wait · `ALWAYS_APPROVE`: every AI fix waits |
+| AI auto-post limit | 1.00 | With `THRESHOLD`: sub-$1 rounding posts by itself; promo patches, fee reclassifications and bank-charge entries wait for a checker |
+| Manual resolutions need a second person | on | People's resolutions wait for a checker |
+| Manual auto-approve limit | 0 | Manual resolutions up to this amount skip the queue |
+
+Fixes that skip the queue are still recorded, as requests approved by `policy:auto`. Pending findings count
+as open leakage until approved. Re-running reconciliation keeps pending findings, and an AI fix a checker
+rejected is not proposed again for the same finding.
+
+The seeder creates a checker login next to the owner (`demo+checker@auditx.io`, same password, role
+AUDITOR), so the workflow can be tried straight away. Add real team members with `POST /api/v1/users`.
 
 ## 5. Security model of the Forensic Agent
 

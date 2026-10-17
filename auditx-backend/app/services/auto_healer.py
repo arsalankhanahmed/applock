@@ -3,7 +3,8 @@
 Evaluates every open discrepancy for a tenant against a deterministic forensic rule-book, enriched
 with (simulated) raw gateway API log metadata, settlement-batch context (bank leg) and courier parcel
 records (COD leg). High-confidence, low-risk patterns are resolved
-autonomously (`auto_resolved = TRUE`); everything else receives a ranked root-cause hypothesis and a
+autonomously (`auto_resolved = TRUE`), subject to the tenant's maker-checker policy (see approvals.py):
+fixes above the policy limit are queued as AI proposals for a checker instead. Everything else receives a ranked root-cause hypothesis and a
 machine-readable fix proposal (`ai_suggested_fix` JSONB) for a human reviewer.
 """
 from __future__ import annotations
@@ -14,6 +15,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -22,6 +24,7 @@ from psycopg2.extras import execute_values
 from sqlalchemy import text
 
 from app.database import engine
+from app.services.approvals import POLICY_AUTO, load_policy
 
 logger = logging.getLogger("auditx.auto_healer")
 
@@ -58,6 +61,15 @@ GATEWAY_DETAIL_SQL = text(
 )
 
 ORG_SQL = text("SELECT brand_currency FROM organizations WHERE org_id = :org_id")
+
+# AI fixes a checker already rejected stay rejected when reconciliation rebuilds the finding.
+REJECTED_AI_SQL = text(
+    """
+    SELECT DISTINCT source_order_number, issue_type, ROUND(amount * 100)::bigint AS amount_cents
+      FROM resolution_requests
+     WHERE org_id = :org_id AND proposed_by_type = 'AI' AND status = 'REJECTED'
+    """
+)
 
 SETTLEMENT_CTX_SQL = text(
     """
@@ -532,7 +544,13 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
         brand_currency = conn.execute(ORG_SQL, params).scalar_one()
         logs = pd.read_sql(OPEN_LOGS_SQL, conn, params=params)
         if logs.empty:
-            return {"evaluated": 0, "auto_resolved": 0, "auto_resolved_value": 0.0, "by_category": {}}
+            return {"evaluated": 0, "auto_resolved": 0, "auto_resolved_value": 0.0, "queued_for_approval": 0,
+                    "by_category": {}}
+        policy = load_policy(conn, org_id)
+        rejected = {
+            (r["source_order_number"], r["issue_type"], int(r["amount_cents"]))
+            for r in conn.execute(REJECTED_AI_SQL, params).mappings()
+        }
         gateway_refs = logs.loc[logs["channel"] == "GATEWAY", "source_order_number"].unique().tolist()
         bank_refs = logs.loc[logs["channel"] == "BANK", "source_order_number"].unique().tolist()
         cod_refs = logs.loc[logs["channel"] == "COD", "source_order_number"].unique().tolist()
@@ -558,9 +576,11 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     updates = []
+    requests = []
     by_category: Dict[str, int] = {}
     auto_count = 0
     auto_value_cents = 0
+    queued_count = 0
     for rec in logs.to_dict("records"):
         rec["order_cents"] = _nullable_int(rec["order_cents"])
         rec["gateway_cents"] = _nullable_int(rec["gateway_cents"])
@@ -572,17 +592,40 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
             verdict = evaluate(rec, txns_by_order.get(rec["source_order_number"], []), brand_currency,
                                partners.get(rec["log_id"]))
         by_category[verdict.category] = by_category.get(verdict.category, 0) + 1
+        amount_cents = abs(int(rec["variance_cents"]))
+        status, resolved = "UNRESOLVED", False
         if verdict.auto_resolve:
-            auto_count += 1
-            auto_value_cents += abs(int(rec["variance_cents"]))
+            if (rec["source_order_number"], rec["issue_type"], amount_cents) in rejected:
+                verdict.fix["approval"] = {"status": "REJECTED_EARLIER",
+                                           "note": "A checker rejected this AI fix before; it needs a person."}
+            elif policy.ai_needs_approval(Decimal(amount_cents) / 100):
+                status = "PENDING_APPROVAL"
+                queued_count += 1
+                verdict.fix["approval"] = {"status": "PENDING", "proposed_by": "AI Auto-Healer",
+                                           "proposed_at": now.isoformat()}
+            else:
+                status, resolved = "RESOLVED", True
+                auto_count += 1
+                auto_value_cents += amount_cents
+                verdict.fix["approval"] = {"status": "APPROVED", "proposed_by": "AI Auto-Healer",
+                                           "approved_by": POLICY_AUTO, "approved_at": now.isoformat()}
+            if status != "UNRESOLVED":
+                requests.append((
+                    str(org_id), rec["log_id"], rec["source_order_number"], rec["issue_type"], rec["channel"],
+                    f"{amount_cents // 100}.{amount_cents % 100:02d}", verdict.category,
+                    json.dumps(verdict.fix, default=str), "AI",
+                    "PENDING" if status == "PENDING_APPROVAL" else "APPROVED",
+                    None if status == "PENDING_APPROVAL" else POLICY_AUTO,
+                    None if status == "PENDING_APPROVAL" else now,
+                ))
         updates.append((
             rec["log_id"],
             verdict.category,
             verdict.confidence,
             json.dumps(verdict.fix, default=str),
-            verdict.auto_resolve,
-            "RESOLVED" if verdict.auto_resolve else "UNRESOLVED",
-            now if verdict.auto_resolve else None,
+            resolved,
+            status,
+            now if resolved else None,
         ))
 
     raw = engine.raw_connection()
@@ -608,6 +651,19 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
                 template="(%s, %s, %s::numeric, %s, %s::boolean, %s, %s::timestamptz)",
                 page_size=2000,
             )
+            if requests:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO resolution_requests
+                        (org_id, log_id, source_order_number, issue_type, channel, amount, root_cause_category,
+                         proposed_fix, proposed_by_type, status, decided_by_email, decided_at)
+                    VALUES %s
+                    """,
+                    requests,
+                    template="(%s::uuid, %s::uuid, %s, %s, %s, %s::numeric, %s, %s::jsonb, %s, %s, %s, %s::timestamptz)",
+                    page_size=2000,
+                )
         raw.commit()
     except Exception:
         raw.rollback()
@@ -619,6 +675,8 @@ def heal_org(org_id: UUID) -> Dict[str, Any]:
         "evaluated": len(updates),
         "auto_resolved": auto_count,
         "auto_resolved_value": round(auto_value_cents / 100, 2),
+        "queued_for_approval": queued_count,
+        "approval_policy": policy.auto_heal_mode,
         "by_category": by_category,
     }
     logger.info("Auto-healer org=%s %s", org_id, result)
