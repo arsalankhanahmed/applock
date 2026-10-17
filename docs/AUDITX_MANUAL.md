@@ -132,6 +132,7 @@ Interactive OpenAPI docs: `http://localhost:8000/docs`.
 | POST | `/claims/{claim_id}/submit` | Mark as sent; `{"send_email": true, "counterparty_contact": "..."}` emails the letter |
 | POST | `/claims/{claim_id}/payments` | `{"amount", "reference", "received_on"}`; refused above the outstanding balance |
 | POST | `/claims/{claim_id}/reject` / `write-off` / `cancel` | Counterparty refused (needs `note`) / stop chasing the balance (needs `note`) / drop a draft |
+| GET | `/couriers/scorecard?days=90`, `/couriers/scorecard.csv` | Per-courier grade and score, delivery success, days to remit, on-time %, charges, money owed and claims (any role; `days` 7–730) |
 | GET / PUT | `/alerts/settings` | Optional WhatsApp / email digest settings (off by default) and what the server can send (OWNER / ADMIN) |
 | GET / POST | `/alerts/recipients` | List / add a recipient: `name`, `channel` (`WHATSAPP` or `EMAIL`), `address` (E.164 phone or email), `consent: true` (OWNER / ADMIN) |
 | PATCH / DELETE | `/alerts/recipients/{recipient_id}` | Pause / resume (`active`) or remove a recipient |
@@ -307,6 +308,42 @@ questions such as *"How much have we recovered from couriers?"* from the claim t
 like every other table.
 
 Roles: OWNER, ADMIN and ANALYST run claims. AUDITOR and VIEWER can see them but not create or change them.
+
+### 4.9 Courier scorecard
+
+The **Courier Scorecard** panel compares every courier on the things that cost a COD business money, so a client
+can decide who gets more parcels and negotiate rates with evidence.
+
+| Measure | How it is worked out |
+|---|---|
+| Delivery success | delivered ÷ (delivered + returned + lost or stuck longer than `PARCEL_STUCK_DAYS`) |
+| Days to remit | average (and 90th percentile) days from delivery to remittance |
+| On time | remittances within `COD_REMITTANCE_SLA_DAYS` ÷ (all remittances + deliveries still unremitted past the SLA) |
+| Avg charge / overcharged | average delivery charge on delivered parcels; parcels flagged `COURIER_OVERCHARGE` and the excess |
+| Owes you | open COD findings the courier is responsible for (not remitted, short, overcharged, lost) |
+| Claimed / recovered | from Recovery & Claims |
+
+**Score (0–100)** is a weighted mix of five components:
+
+| Component | Weight | How it scores |
+|---|---|---|
+| Remittance speed | 30% | 100 at ≤ 2 days, 0 at twice the SLA |
+| Remitted on time | 20% | the on-time % |
+| Delivery success | 20% | the delivery success % |
+| Charge accuracy | 15% | −5 points per 1% of deliveries overcharged |
+| Money not owed | 15% | −10 points per 1% of collected COD still owed |
+
+A component with no data is left out, and the other weights are scaled up.
+
+**Grades:** A ≥ 85, B ≥ 70, C ≥ 55, D ≥ 40, F below that. Couriers with fewer than 20 parcels are marked *low
+volume*, and they only compete for the "best" badges when no courier has enough volume.
+
+**The badges:** best overall, fastest to remit, best delivery rate, lowest charge.
+
+The window covers parcels booked in the last 30, 90, 180 or 365 days, up to the **latest date in the courier
+reports**. The scorecard therefore stays the same until new reports arrive, the same way the COD reconciliation
+works. **Download CSV** exports the table, and the forensic agent answers questions like *"Which is the best
+courier for us?"*.
 
 ### 4.8 WhatsApp alerts (optional, per client)
 

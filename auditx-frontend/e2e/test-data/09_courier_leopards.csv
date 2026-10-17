@@ -1,0 +1,4 @@
+tracking_number,source_order_number,courier_name,parcel_status,cod_amount,delivery_charges,remittance_reference,booked_at,delivered_at,remitted_at
+LP1,L1,Leopards,Delivered,90.00,2.20,LCS-77,2026-09-28,2026-09-30,2026-10-02
+LP2,L2,Leopards,Delivered,120.00,2.20,LCS-77,2026-09-28,2026-09-30,2026-10-02
+LP3,L3,Leopards,Delivered,75.00,2.20,LCS-77,2026-09-29,2026-10-01,2026-10-02

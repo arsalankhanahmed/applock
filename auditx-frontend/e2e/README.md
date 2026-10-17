@@ -29,6 +29,9 @@ Black-box tests that drive a real Chromium browser through the AuditX dashboard,
 | | UC-18 | A recipient needs consent and an international number |
 | | UC-18 | The preview lists what needs attention; a test message is delivered and logged with the number masked |
 | | UC-17 | Analysts don't see alert settings |
+| `scorecard.spec.ts` | UC-20 | Couriers are graded and ranked best first, with "best" badges |
+| | UC-20 | The score breakdown explains the grade |
+| | UC-20 | The period filter and CSV download |
 
 Use cases and business test cases: `docs/testing/USE_CASES.md`, `docs/testing/BUSINESS_TEST_CASES.md`.
 
@@ -46,6 +49,7 @@ Each spec registers a **brand-new company** through the API, adds its users, upl
 | `05_courier_update_c2_remitted.csv` | TCS's later report: C2 now remitted under CPR-2 (used by UC-16) |
 | `06_bank_statement_update.csv` | The bank credit for CPR-2, 67.50 (used by UC-16) |
 | `07_alert_recipients.csv` | Alert recipients: one valid (+92 300 1234567), one refused local number (used by UC-18) |
+| `08_erp_orders_leopards.csv` · `09_courier_leopards.csv` · `10_bank_statement_leopards.csv` | A second courier for the scorecard: Leopards delivers 3 COD orders, remits in 1–2 days, money banked (used by UC-20) |
 | `expected_results.csv` | What AuditX must find and why: 4 findings, 4 clean matches, and C2's recovery after files 05/06 |
 
 **Expected findings:** O2 *Missing Payment* 55.00 · O3 *Untracked Revenue* 42.00 · O4 *Amount Mismatch* 5.00 (AI fix waits for a checker) · C2 *COD Not Remitted* 70.00 order, 67.50 owed by TCS after its 2.50 charge. C2 is the one **claimable** finding.

@@ -43,8 +43,8 @@ from app.models.schemas import (AgentQueryRequest, AgentQueryResponse, ApprovalP
                                 ClaimStatus, ClaimSubmit, RecoverySummary,
                                 AlertDeliveryOut, AlertPreview, AlertRecipientIn, AlertRecipientOut,
                                 AlertRecipientUpdate, AlertSettingsIn, AlertSettingsOut, AlertTestRequest,
-                                AlertTestResult)
-from app.services import ai_agent, alerts, approvals, mailer, recovery
+                                AlertTestResult, CourierScorecard)
+from app.services import ai_agent, alerts, approvals, courier_scorecard, mailer, recovery
 from app.workers.tasks import ingest_file, run_reconciliation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -742,6 +742,23 @@ async def write_off_claim(claim_id: UUID, body: ClaimNote, user: CurrentUser = D
 @app.post(f"{P}/claims/{{claim_id}}/cancel", response_model=ClaimOut, tags=["recovery"])
 async def cancel_claim(claim_id: UUID, user: CurrentUser = Depends(require_roles(*WRITE_ROLES))) -> Dict[str, Any]:
     return await run_in_threadpool(_in_tx, recovery.cancel_claim, user.org_id, claim_id, user.email)
+
+
+# ----------------------------------------------------------------------------- courier scorecard
+@app.get(f"{P}/couriers/scorecard", response_model=CourierScorecard, tags=["couriers"])
+async def get_courier_scorecard(days: int = Query(90, ge=7, le=730),
+                                user: CurrentUser = Depends(current_user)) -> Dict[str, Any]:
+    """Each courier's remittance speed, on-time rate, delivery success, charges, money owed and claims, with a
+    0-100 score and grade. The window ends at the latest date in the courier reports."""
+    return await run_in_threadpool(_read, courier_scorecard.build, user.org_id, days)
+
+
+@app.get(f"{P}/couriers/scorecard.csv", tags=["couriers"])
+async def get_courier_scorecard_csv(days: int = Query(90, ge=7, le=730),
+                                    user: CurrentUser = Depends(current_user)) -> Response:
+    card = await run_in_threadpool(_read, courier_scorecard.build, user.org_id, days)
+    return Response(courier_scorecard.to_csv(card), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="courier-scorecard-{days}d.csv"'})
 
 
 # ----------------------------------------------------------------------------- alerts (optional, per tenant)

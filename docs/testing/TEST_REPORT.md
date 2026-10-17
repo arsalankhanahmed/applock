@@ -2,29 +2,38 @@
 
 | Item | Value |
 |---|---|
-| Build under test | branch `ccr-4b6a270d-we3a5h` (AuditX 1.0.0 + Recovery & Claims + WhatsApp alerts) |
+| Build under test | branch `ccr-4b6a270d-we3a5h` (AuditX 1.0.0 + Recovery & Claims + WhatsApp alerts + Courier scorecard) |
 | Test date | 2026-10-17 |
 | Environment | Linux, Python 3.13, PostgreSQL 16, Redis 7, Celery 5 (eager for backend tests, real worker for UI tests), Node 20, Next.js 14.2, Chromium (Playwright 1.56.1) |
 | Strategy | [TEST_STRATEGY.md](TEST_STRATEGY.md) · cases: [USE_CASES.md](USE_CASES.md), [BUSINESS_TEST_CASES.md](BUSINESS_TEST_CASES.md) |
 
 ## 1. Summary
 
-**All 391 automated tests pass.** Testing found **11 defects** (3 High, 3 Medium, 5 Low). All are fixed and each has a regression test. There are no open defects.
+**All 424 automated tests pass.** Testing found **11 defects** (3 High, 3 Medium, 5 Low). All are fixed and each has a regression test. There are no open defects.
 
 | Suite | Kind | Tests | Passed | Failed | Time |
 |---|---|---:|---:|---:|---:|
-| `tests/unit` | White box | 202 | 202 | 0 | 2.2 s |
-| `tests/integration` | Integration with PostgreSQL | 64 | 64 | 0 | 18 s |
-| `tests/api` | Black box (HTTP) | 74 | 74 | 0 | 70 s |
-| `tests/regression` | Regression and planted-vs-found | 27 | 27 | 0 | 7.7 s |
-| **Backend total** | | **367** | **367** | **0** | 114 s |
-| `auditx-frontend/e2e` | Black-box UI, desktop Chromium | 23 | 23 | 0 | 58 s (two consecutive full runs) |
+| `tests/unit` | White box | 219 | 219 | 0 | 2.5 s |
+| `tests/integration` | Integration with PostgreSQL | 70 | 70 | 0 | 20 s |
+| `tests/api` | Black box (HTTP) | 81 | 81 | 0 | 76 s |
+| `tests/regression` | Regression and planted-vs-found | 27 | 27 | 0 | 7.8 s |
+| **Backend total** | | **397** | **397** | **0** | 120 s |
+| `auditx-frontend/e2e` | Black-box UI, desktop Chromium | 26 | 26 | 0 | 66 s (two consecutive full runs) |
 | `auditx-frontend/e2e` | Black-box UI, mobile (Pixel 7) | 1 | 1 | 0 | |
-| **Grand total** | | **391** | **391** | **0** | |
+| **Grand total** | | **424** | **424** | **0** | |
 
-Business test cases BTC-01 to BTC-53 all **pass** ([traceability](BUSINESS_TEST_CASES.md)).
+Business test cases BTC-01 to BTC-57 all **pass** ([traceability](BUSINESS_TEST_CASES.md)).
 
-**WhatsApp alerts (latest release)** add 58 tests: 31 unit, 9 integration, 14 API and 4 UI scenarios (UC-17 to UC-19, BTC-46 to BTC-53). They cover:
+**Courier scorecard (latest release)** adds 33 tests: 17 unit, 6 integration, 7 API and 3 UI scenarios (UC-20, BTC-54 to BTC-57). They cover:
+- the score formula and each of its five components;
+- grade bands;
+- the "best" badges, with low-volume handling;
+- exact metrics against a fast and a slow courier fixture (counts, cash, remittance days, on-time %, overcharges, money owed, claims);
+- a window anchored to the latest report date;
+- the CSV export, roles and tenant isolation;
+- the forensic agent ranking couriers.
+
+**WhatsApp alerts** add 58 tests: 31 unit, 9 integration, 14 API and 4 UI scenarios (UC-17 to UC-19, BTC-46 to BTC-53). They cover:
 - off by default, with only Owner / Admin able to switch alerts on;
 - recipient consent and phone-number validation;
 - digest content, thresholds and sections;
@@ -56,21 +65,22 @@ Static checks: `tsc --noEmit` is clean, `next lint` reports no warnings or error
 | services/approvals.py | 88 | 0 | **100%** |
 | services/bank_reconciliation.py | 93 | 0 | **100%** |
 | services/cod_reconciliation.py | 84 | 0 | **100%** |
-| models/schemas.py | 494 | 0 | **100%** |
+| services/courier_scorecard.py *(new)* | 93 | 0 | **100%** |
+| models/schemas.py | 533 | 0 | **100%** |
 | config.py | 80 | 2 | 98% |
 | services/reconciliation.py | 121 | 3 | 98% |
 | services/recovery.py | 311 | 9 | 97% |
 | services/auto_healer.py | 261 | 7 | 97% |
 | services/mailer.py | 66 | 2 | 97% |
-| services/alerts.py *(new)* | 239 | 10 | 96% |
+| services/alerts.py | 239 | 10 | 96% |
 | services/parser.py | 320 | 17 | 95% |
-| main.py | 568 | 33 | 94% |
-| services/whatsapp.py *(new)* | 86 | 6 | 93% |
+| main.py | 575 | 33 | 94% |
+| services/whatsapp.py | 86 | 6 | 93% |
 | utils/seeder.py | 331 | 30 | 91% |
 | workers/tasks.py | 59 | 8 | 86% |
 | services/ai_agent.py | 178 | 25 | 86% (the uncovered lines are the live OpenAI HTTP calls, which are mocked) |
 | database.py | 36 | 14 | 61% (engine and pool bootstrapping) |
-| **Total** | **3415** | **166** | **95%** |
+| **Total** | **3554** | **166** | **95%** |
 
 The exit criterion "`app/services` ≥ 85%" is met: every service module is between 86% and 100%.
 
