@@ -5,6 +5,9 @@ import { defineConfig, devices } from "@playwright/test";
  * `uvicorn` + `celery` + `next start`). Every spec creates its own company through the public API,
  * so runs are repeatable and never touch demo data.
  */
+// E2E_EVIDENCE=1 records a screenshot, video and trace of every test (for demos and audit evidence).
+const evidence = Boolean(process.env.E2E_EVIDENCE);
+
 export default defineConfig({
   testDir: "./e2e",
   timeout: 60_000,
@@ -15,8 +18,9 @@ export default defineConfig({
   reporter: [["list"], ["html", { open: "never", outputFolder: "e2e-report" }]],
   use: {
     baseURL: process.env.E2E_BASE_URL ?? "http://localhost:3000",
-    trace: "retain-on-failure",
-    screenshot: "only-on-failure",
+    trace: evidence ? "on" : "retain-on-failure",
+    screenshot: evidence ? "on" : "only-on-failure",
+    video: evidence ? "on" : "off",
     launchOptions: process.env.E2E_CHROMIUM_PATH ? { executablePath: process.env.E2E_CHROMIUM_PATH } : {},
   },
   projects: [

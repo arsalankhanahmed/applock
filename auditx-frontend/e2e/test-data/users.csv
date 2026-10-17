@@ -1,0 +1,6 @@
+role,full_name,email_pattern,password,how_created,used_in
+OWNER,Olivia Owner,owner.<run-id>@e2e-auditx.com,Str0ng#Passw0rd,Registers the company via API,All specs
+ANALYST (maker),Asad Analyst,analyst.<run-id>@e2e-auditx.com,Str0ng#Passw0rd,Added by owner with temporary password; first-login change done via API,UC-02 / UC-05 / UC-11
+AUDITOR (checker),Ayesha Auditor,auditor.<run-id>@e2e-auditx.com,Str0ng#Passw0rd,Added by owner with temporary password; first-login change done via API,UC-06
+AUDITOR (invited),Imran Invitee,invitee.<run-id>@e2e-auditx.com,Str0ng#Passw0rd,Invited through the Team panel UI; joins via the link,UC-09
+ANALYST (temp password),Tariq Temp,temp.<run-id>@e2e-auditx.com,generated in the UI,Added through the Team panel UI; forced to choose own password,UC-10

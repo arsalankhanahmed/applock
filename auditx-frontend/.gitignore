@@ -6,3 +6,4 @@ out/
 test-results/
 e2e-report/
 playwright/.cache/
+playwright-report/

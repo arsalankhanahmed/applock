@@ -1,0 +1,4 @@
+tracking_number,source_order_number,courier_name,parcel_status,cod_amount,delivery_charges,remittance_reference,booked_at,delivered_at,remitted_at
+T1,C1,TCS,Delivered,60.00,2.50,CPR-1,2026-09-01,2026-09-03,2026-09-10
+T2,C2,TCS,Delivered,70.00,2.50,,2026-09-01,2026-09-03,
+T9,LATE,TCS,In transit,0,0,,2026-10-10,,
