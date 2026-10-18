@@ -180,6 +180,8 @@ overdue. Nothing here is auto-resolved: every finding is money to recover, so yo
 
 **Discovery hook:** "What share of your orders is COD, and which couriers do you use?"
 
+**Courier scorecard:** every courier gets a grade, for example *"Leopards A · remits in 1.7 days · TCS C · 7 days, PKR 2.3 lakh still owed"*. The grade is built from remittance speed, on-time rate, delivery success, charge accuracy and money owed. *"Next quarter, give your parcels to the courier that pays you back fastest."*
+
 ---
 
 ## Slide 11 — AI Auto-Healer

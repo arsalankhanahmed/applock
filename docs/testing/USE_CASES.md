@@ -210,3 +210,15 @@ Verified by: BTC-48, BTC-49, BTC-50
 * **E3** Cron endpoint without the right token → 403 (404 when no token is configured).
 
 Verified by: BTC-51, BTC-53
+
+### UC-20 Compare couriers on the scorecard
+**Actor:** any member · **Pre:** courier reports uploaded and reconciled
+
+1. User opens **Courier Scorecard**, which ranks couriers best first with grade, score, delivery success, days to remit, on time, average charge, overcharges and money owed, plus "best" badges.
+2. User clicks a courier for the score breakdown (five weighted components) and cash, overdue and claim details.
+3. User changes the period (30 / 90 / 180 / 365 days) or downloads the CSV to negotiate rates.
+
+* **A1** Only one courier → no "best" badges. **A2** No courier data → a prompt to upload reports.
+* **E1** Period outside 7–730 days → 422.
+
+Verified by: BTC-54, BTC-55, BTC-56, BTC-57

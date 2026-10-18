@@ -656,3 +656,49 @@ class AlertDeliveryOut(BaseModel):
     summary: Optional[str]
     created_at: datetime
     finished_at: Optional[datetime]
+
+
+# ---------------------------------------------------------------- courier scorecard
+class ScoreComponents(BaseModel):
+    speed: Optional[float]
+    on_time: Optional[float]
+    delivery: Optional[float]
+    charges: Optional[float]
+    issues: Optional[float]
+
+
+class CourierScore(BaseModel):
+    courier_name: str
+    score: Optional[float]
+    grade: Optional[str]
+    low_volume: bool
+    components: ScoreComponents
+    booked: int
+    delivered: int
+    returned: int
+    lost_or_stuck: int
+    in_transit: int
+    delivery_rate_pct: Optional[float]
+    return_rate_pct: Optional[float]
+    cod_collected: Decimal
+    remitted: Decimal
+    with_courier: Decimal
+    avg_remit_days: Optional[float]
+    p90_remit_days: Optional[float]
+    on_time_pct: Optional[float]
+    overdue_unremitted: int
+    avg_charge: Optional[Decimal]
+    overcharged: int
+    overcharge_value: Decimal
+    owed_now: Decimal
+    claimed: Decimal
+    recovered: Decimal
+    claims_rejected: int
+
+
+class CourierScorecard(BaseModel):
+    as_of: Optional[datetime]
+    days: int
+    currency: str
+    couriers: List[CourierScore]
+    best: Dict[str, str]

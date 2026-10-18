@@ -706,6 +706,245 @@ function CourierLedger({ metrics, loading }: { metrics: DashboardMetrics | null;
   );
 }
 
+/* ============================================================================
+ * Courier scorecard
+ * ========================================================================== */
+interface CourierScoreRow {
+  courier_name: string;
+  score: number | null;
+  grade: string | null;
+  low_volume: boolean;
+  components: { speed: number | null; on_time: number | null; delivery: number | null; charges: number | null; issues: number | null };
+  booked: number;
+  delivered: number;
+  returned: number;
+  lost_or_stuck: number;
+  in_transit: number;
+  delivery_rate_pct: number | null;
+  return_rate_pct: number | null;
+  cod_collected: Money;
+  with_courier: Money;
+  avg_remit_days: number | null;
+  p90_remit_days: number | null;
+  on_time_pct: number | null;
+  overdue_unremitted: number;
+  avg_charge: Money | null;
+  overcharged: number;
+  overcharge_value: Money;
+  owed_now: Money;
+  claimed: Money;
+  recovered: Money;
+  claims_rejected: number;
+}
+
+interface CourierScorecardData {
+  as_of: string | null;
+  days: number;
+  currency: string;
+  couriers: CourierScoreRow[];
+  best: Partial<Record<"overall" | "fastest_remittance" | "best_delivery" | "cheapest", string>>;
+}
+
+const GRADE_TONE: Record<string, string> = {
+  A: "text-emerald-300 bg-emerald-500/10 ring-emerald-500/30",
+  B: TONE.sky,
+  C: TONE.amber,
+  D: TONE.orange,
+  F: TONE.rose,
+};
+
+const COMPONENT_LABEL: { key: keyof CourierScoreRow["components"]; label: string; weight: string }[] = [
+  { key: "speed", label: "Remittance speed", weight: "30%" },
+  { key: "on_time", label: "Remitted on time", weight: "20%" },
+  { key: "delivery", label: "Delivery success", weight: "20%" },
+  { key: "charges", label: "Charge accuracy", weight: "15%" },
+  { key: "issues", label: "Money not owed", weight: "15%" },
+];
+
+const BEST_LABEL: Record<string, string> = {
+  overall: "Best overall",
+  fastest_remittance: "Fastest to remit",
+  best_delivery: "Best delivery rate",
+  cheapest: "Lowest charge",
+};
+
+function CourierScorecard({ token, refreshKey }: { token: string; refreshKey: number }) {
+  const [days, setDays] = useState(90);
+  const [data, setData] = useState<CourierScorecardData | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<CourierScorecardData>(`/api/v1/couriers/scorecard?days=${days}`, token)
+      .then((d) => !cancelled && setData(d))
+      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "Could not load the scorecard"));
+    return () => {
+      cancelled = true;
+    };
+  }, [token, refreshKey, days]);
+
+  async function download() {
+    const res = await fetch(`${API_BASE}/api/v1/couriers/scorecard.csv?days=${days}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return setError(`Download failed (${res.status})`);
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `courier-scorecard-${days}d.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const c = data?.currency ?? "USD";
+  const dayText = (v: number | null) => (v === null ? "—" : `${v.toFixed(1)} d`);
+  const pctText = (v: number | null) => (v === null ? "—" : `${v.toFixed(1)}%`);
+
+  return (
+    <Card
+      title="Courier Scorecard"
+      action={
+        <div className="flex items-center gap-2">
+          <select
+            aria-label="Scorecard period"
+            value={days}
+            onChange={(e) => setDays(Number(e.target.value))}
+            className="rounded-lg border border-ink-600 bg-ink-850 px-2.5 py-1.5 text-xs text-slate-200 outline-none focus:border-emerald-500"
+          >
+            {[30, 90, 180, 365].map((d) => (
+              <option key={d} value={d}>
+                Last {d} days
+              </option>
+            ))}
+          </select>
+          <button onClick={() => void download()} className="rounded-md border border-ink-600 px-2.5 py-1 text-[11px] text-slate-300 hover:border-slate-400">
+            Download CSV
+          </button>
+        </div>
+      }
+    >
+      {error && <p className="mb-3 rounded-md bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</p>}
+      {!data ? (
+        <Skeleton className="h-24" />
+      ) : data.couriers.length === 0 ? (
+        <p className="text-sm text-slate-500">Upload courier COD reports to compare TCS, Leopards, PostEx, Trax and others.</p>
+      ) : (
+        <>
+          {Object.keys(data.best).length > 0 && (
+            <div className="mb-3 flex flex-wrap gap-2 text-xs" aria-label="Courier leaders">
+              {Object.entries(data.best).map(([k, name]) => (
+                <Badge key={k} className="text-emerald-300 bg-emerald-500/10 ring-emerald-500/30">
+                  {BEST_LABEL[k] ?? humanize(k)}: {name}
+                </Badge>
+              ))}
+            </div>
+          )}
+          <div className="-mx-5 overflow-x-auto">
+            <table className="w-full min-w-[820px] text-sm">
+              <thead>
+                <tr className="text-left text-[11px] uppercase tracking-wider text-slate-500">
+                  <th className="px-5 pb-2 font-medium">Courier</th>
+                  <th className="pb-2 font-medium">Grade</th>
+                  <th className="pb-2 text-right font-medium">Parcels</th>
+                  <th className="pb-2 text-right font-medium">Delivered</th>
+                  <th className="pb-2 text-right font-medium">Days to remit</th>
+                  <th className="pb-2 text-right font-medium">On time</th>
+                  <th className="pb-2 text-right font-medium">Avg charge</th>
+                  <th className="pb-2 text-right font-medium">Overcharged</th>
+                  <th className="px-5 pb-2 text-right font-medium">Owes you</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-ink-700">
+                {data.couriers.map((r) => (
+                  <Fragment key={r.courier_name}>
+                    <tr
+                      data-testid="scorecard-row"
+                      onClick={() => setOpen(open === r.courier_name ? null : r.courier_name)}
+                      className="cursor-pointer hover:bg-ink-850"
+                    >
+                      <td className="px-5 py-2 font-medium text-slate-200">
+                        <span className="mr-1.5 inline-block w-3 text-slate-500">{open === r.courier_name ? "▾" : "▸"}</span>
+                        {r.courier_name}
+                        {r.low_volume && <span className="ml-2 text-[10px] font-normal text-slate-500">low volume</span>}
+                      </td>
+                      <td className="py-2">
+                        {r.grade ? (
+                          <Badge className={GRADE_TONE[r.grade] ?? TONE.sky}>
+                            {r.grade} · {r.score?.toFixed(0)}
+                          </Badge>
+                        ) : (
+                          <span className="text-slate-500">—</span>
+                        )}
+                      </td>
+                      <td className="tabular py-2 text-right text-slate-300">{integer(r.booked)}</td>
+                      <td className="tabular py-2 text-right text-slate-300">{pctText(r.delivery_rate_pct)}</td>
+                      <td className="tabular py-2 text-right text-slate-300">{dayText(r.avg_remit_days)}</td>
+                      <td className="tabular py-2 text-right text-slate-300">{pctText(r.on_time_pct)}</td>
+                      <td className="tabular py-2 text-right text-slate-300">{r.avg_charge === null ? "—" : money(r.avg_charge, c)}</td>
+                      <td className={`tabular py-2 text-right ${r.overcharged ? "text-orange-300" : "text-slate-500"}`}>{integer(r.overcharged)}</td>
+                      <td className={`tabular px-5 py-2 text-right ${num(r.owed_now) > 0 ? "font-medium text-rose-300" : "text-slate-500"}`}>
+                        {money(r.owed_now, c)}
+                      </td>
+                    </tr>
+                    {open === r.courier_name && (
+                      <tr className="bg-ink-950/60">
+                        <td colSpan={9} className="px-5 py-3">
+                          <div className="grid gap-4 text-xs md:grid-cols-2" data-testid="scorecard-detail">
+                            <ul className="space-y-1.5" aria-label={`Score breakdown for ${r.courier_name}`}>
+                              {COMPONENT_LABEL.map(({ key, label, weight }) => {
+                                const v = r.components[key];
+                                return (
+                                  <li key={key} className="flex items-center gap-2">
+                                    <span className="w-36 text-slate-400">
+                                      {label} <span className="text-slate-600">({weight})</span>
+                                    </span>
+                                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-ink-700">
+                                      <div className="h-full bg-emerald-400" style={{ width: `${v ?? 0}%` }} />
+                                    </div>
+                                    <span className="tabular w-10 text-right text-slate-300">{v === null ? "n/a" : v.toFixed(0)}</span>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                            <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-slate-400">
+                              <dt>Delivered · returned · lost</dt>
+                              <dd className="tabular text-slate-200">
+                                {r.delivered} · {r.returned} · {r.lost_or_stuck}
+                                {r.in_transit ? ` (+${r.in_transit} in transit)` : ""}
+                              </dd>
+                              <dt>COD collected</dt>
+                              <dd className="tabular text-slate-200">{money(r.cod_collected, c)}</dd>
+                              <dt>Still with courier</dt>
+                              <dd className="tabular text-orange-300">{money(r.with_courier, c)}</dd>
+                              <dt>90% remitted within</dt>
+                              <dd className="tabular text-slate-200">{dayText(r.p90_remit_days)}</dd>
+                              <dt>Overdue (not remitted)</dt>
+                              <dd className="tabular text-slate-200">{plural(r.overdue_unremitted, "parcel")}</dd>
+                              <dt>Overcharged by</dt>
+                              <dd className="tabular text-slate-200">{money(r.overcharge_value, c)}</dd>
+                              <dt>Claimed · recovered</dt>
+                              <dd className="tabular text-slate-200">
+                                {money(r.claimed, c)} · <span className="text-emerald-300">{money(r.recovered, c)}</span>
+                                {r.claims_rejected ? ` · ${r.claims_rejected} rejected` : ""}
+                              </dd>
+                            </dl>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-[11px] text-slate-500">
+            Parcels booked in the {data.days} days up to {data.as_of ? data.as_of.slice(0, 10) : "—"}, the latest date in your courier reports. Click a courier for the score breakdown.
+          </p>
+        </>
+      )}
+    </Card>
+  );
+}
+
 function RootCausePanel({ metrics, loading }: { metrics: DashboardMetrics | null; loading: boolean }) {
   const c = metrics?.brand_currency ?? "USD";
   return (
@@ -3328,6 +3567,9 @@ export default function DashboardPage() {
           </div>
           <PanelBoundary title="Courier ledger">
             <CourierLedger metrics={metrics} loading={loading && !metrics} />
+          </PanelBoundary>
+          <PanelBoundary title="Courier scorecard">
+            <CourierScorecard token={session.token} refreshKey={refreshKey} />
           </PanelBoundary>
           <PanelBoundary title="Recovery">
             <RecoveryPanel token={session.token} refreshKey={refreshKey} canWrite={canWrite} onChanged={refresh} />

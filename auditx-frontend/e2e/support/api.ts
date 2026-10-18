@@ -54,6 +54,13 @@ export async function uploadTestFile(request: APIRequestContext, token: string, 
   await upload(request, token, target, readFileSync(join(DATA_DIR, file), "utf8"));
 }
 
+/** Runs reconciliation + auto-heal and waits for it (e.g. after uploading extra test files). */
+export async function reconcile(request: APIRequestContext, token: string) {
+  const run = await request.post(`${API}/api/v1/reconciliation/run`, { headers: bearer(token), data: { auto_heal: true } });
+  expect(run.status()).toBe(202);
+  await waitForJob(request, token, (await run.json()).job_id);
+}
+
 async function upload(request: APIRequestContext, token: string, target: string, csv: string) {
   const res = await request.post(`${API}/api/v1/ingest/${target}`, {
     headers: bearer(token),

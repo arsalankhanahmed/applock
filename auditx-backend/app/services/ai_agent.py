@@ -340,6 +340,21 @@ _INTENTS: List[Tuple[re.Pattern, str, str]] = [
             GROUP BY r.proposed_by_type, r.root_cause_category ORDER BY pending_value DESC LIMIT 50""",
     ),
     (
+        re.compile(r"(scorecard|best courier|worst courier|compare couriers?|courier (performance|ranking)|"
+                   r"(fast|slow)(est)? (courier|remit))", re.I),
+        "Courier performance: delivery success, average days to remit and money still with each courier.",
+        """SELECT c.courier_name, COUNT(*) AS parcels,
+                  ROUND(100.0 * COUNT(*) FILTER (WHERE c.parcel_status = 'DELIVERED')
+                        / NULLIF(COUNT(*) FILTER (WHERE c.parcel_status IN ('DELIVERED', 'RETURNED', 'LOST')), 0), 1)
+                        AS delivery_rate_pct,
+                  ROUND(AVG(EXTRACT(EPOCH FROM (c.remitted_at - c.delivered_at)) / 86400)
+                        FILTER (WHERE c.remitted_at IS NOT NULL), 1) AS avg_days_to_remit,
+                  ROUND(COALESCE(SUM(c.cod_amount - c.delivery_charges)
+                        FILTER (WHERE c.parcel_status = 'DELIVERED' AND c.remittance_reference IS NULL), 0), 2) AS with_courier
+             FROM courier_remittances c WHERE c.org_id = :org_id
+            GROUP BY c.courier_name ORDER BY avg_days_to_remit ASC NULLS LAST LIMIT 50""",
+    ),
+    (
         re.compile(r"(courier|cod\b|cash on delivery|remit|rider|tcs|leopards|postex|trax)", re.I),
         "Cash owed by each courier: delivered COD not yet remitted, charges and returns.",
         """SELECT c.courier_name, COUNT(*) FILTER (WHERE c.parcel_status = 'DELIVERED') AS delivered,

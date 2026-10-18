@@ -116,3 +116,14 @@ Server in test mode: `WHATSAPP_PROVIDER=log` (messages are recorded, not sent). 
 | BTC-51 | P1 | One digest per period, failures retried | Alerts on; WhatsApp + email recipients; no SMTP | Run the scheduler 4 times | WhatsApp sent once; email retried, 3 FAILED attempts then stops; next day sends again | `test_one_digest_per_period…`, `test_nothing_is_sent_when_disabled_or_before_the_hour`, `test_cron_endpoint_needs_its_token` | Pass |
 | BTC-52 | P1 | Only Owner / Admin manage alerts; data stays private | Analyst; second company; forensic agent | Analyst opens dashboard / calls API; other company edits recipient; agent queries alert_recipients | No panel, 403; 404 across companies; agent refuses | `e2e/alerts.spec.ts` UC-17, `test_only_owners_and_admins_manage_alerts`, `test_alert_settings_are_tenant_scoped`, `test_agent_cannot_read_alert_recipients` | Pass |
 | BTC-53 | P2 | Providers behave and fail clearly | — | Meta template call; Meta error; Twilio with and without Content SID; timeout; not configured | Correct template payload (one-line params); "HTTP 400: Template name does not exist (code 132001)"; Twilio form; timeout reported, nothing raised | `tests/unit/test_alerts_unit.py` provider tests | Pass |
+
+## Courier scorecard
+
+Extra data for a second courier: `08_erp_orders_leopards.csv`, `09_courier_leopards.csv`, `10_bank_statement_leopards.csv`. Leopards delivers 3 COD orders, remits them 1–2 days later and the money reaches the bank.
+
+| ID | Pri | Title | Preconditions | Steps | Expected | Automated by | Status |
+|---|---|---|---|---|---|---|---|
+| BTC-54 | P1 | Couriers are graded and ranked | Standard dataset + files 08–10, reconciled | Open Courier Scorecard (as Auditor) | LEOPARDS first "A · 100", 1.7 d to remit; TCS "C · 67", 7.0 d, 50.0% on time, owes $67.50; badges Best overall / Fastest / Lowest charge: LEOPARDS | `e2e/scorecard.spec.ts` UC-20, `test_scores_grades_and_leaders` | Pass |
+| BTC-55 | P1 | The grade is explained | BTC-54 | Click TCS | Remittance speed 72, on time 50, money not owed 0; 1 parcel overdue | `e2e/scorecard.spec.ts` breakdown, `test_each_component_reacts_to_its_own_problem` | Pass |
+| BTC-56 | P1 | Numbers match the parcels | Fast + slow courier fixture | Compare metrics with the parcel data | Exact counts, cash, days, on-time %, overcharge 6.50 (9.00 vs 2.50 median), claims recovered | `test_parcel_outcomes_cash_and_speed`, `test_findings_feed_charges_and_money_owed`, `test_claims_show_on_the_courier` | Pass |
+| BTC-57 | P2 | Period filter, CSV and privacy | BTC-54 | 30-day period; Download CSV; other company; no login | TCS shows 1 parcel; file courier-scorecard-30d.csv with LEOPARDS,A,100.0; other company sees none; 401 | `e2e/scorecard.spec.ts` period + CSV, `test_window_ends_at_the_latest_report_date`, `test_csv_download`, `test_scorecard_is_tenant_scoped_and_needs_a_login` | Pass |
