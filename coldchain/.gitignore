@@ -1,8 +1,0 @@
-*.db
-*.db-shm
-*.db-wal
-.venv/
-__pycache__/
-.pytest_cache/
-firmware/.pio/
-backend/firmware_store/
