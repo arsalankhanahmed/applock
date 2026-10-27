@@ -27,6 +27,24 @@
 #define PIN_BATTERY_ADC 35      // Li-ion cell through a 100k/100k divider; -1 = not fitted
 #endif
 
+#ifndef PIN_COOLING_RELAY
+#define PIN_COOLING_RELAY 26    // relay module input; -1 = no cooling control fitted (see README for wiring)
+#endif
+#ifndef RELAY_ACTIVE_LEVEL
+#define RELAY_ACTIVE_LEVEL HIGH // level that ENERGISES the relay, which switches cooling OFF (NC contact)
+#endif
+
+// 4G modem (only with -D TINY_GSM_MODEM_SIM7600 / A7672X): UART and power key.
+#ifndef PIN_MODEM_RX
+#define PIN_MODEM_RX 16         // ESP32 RX  <- modem TX
+#endif
+#ifndef PIN_MODEM_TX
+#define PIN_MODEM_TX 17         // ESP32 TX  -> modem RX
+#endif
+#ifndef PIN_MODEM_PWRKEY
+#define PIN_MODEM_PWRKEY 27     // -1 if the modem board powers up by itself
+#endif
+
 // --- Behaviour ----------------------------------------------------------------------------------------------
 #ifndef FW_VERSION
 #define FW_VERSION "dev"
@@ -40,3 +58,8 @@
 #define WIFI_RETRY_MS 30000
 #define WATCHDOG_S 120
 #define BATTERY_DIVIDER 2.0f
+// Cooling switched off by the server comes back ON by itself if the server has not been heard for this long,
+// so a lost connection can never leave restocked goods without cooling.
+#define COOLING_FAILSAFE_MS (60UL * 60 * 1000)
+#define OTA_RETRY_MS (60UL * 60 * 1000)  // a failed update is retried at most hourly
+// Build with -D TLS_INSECURE to skip certificate checks (testing against a self-signed server only).

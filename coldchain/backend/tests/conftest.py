@@ -14,6 +14,7 @@ os.environ.update({
     "ESCALATION_MINUTES": "15",
     "REMINDER_MINUTES": "30",
     "TICK_TOKEN": "tick-secret",
+    "FIRMWARE_DIR": os.path.join(os.path.dirname(_db), "fw"),
 })
 
 import pytest  # noqa: E402

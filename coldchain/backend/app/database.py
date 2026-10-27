@@ -80,8 +80,70 @@ class Device(Base):
     mains_power: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     network: Mapped[str] = mapped_column(String(20), default="")       # "wifi" / "cellular"
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    # --- Stock & cooling control (see services/stock.py) ---
+    # The ERP's own code for this fridge / cold room, so it can address it without knowing our serial.
+    erp_code: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
+    stock_state: Mapped[str] = mapped_column(String(10), default="UNKNOWN")      # UNKNOWN | STOCKED | EMPTY
+    stock_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Opt-in: switch cooling off once the appliance has been empty for COOLING_OFF_DELAY_MINUTES.
+    auto_cooling_off: Mapped[bool] = mapped_column(Boolean, default=False)
+    # While empty: keep recording readings (True) or only send a heartbeat (False).
+    share_data_when_empty: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Manual override from the dashboard: None = automatic, "on" / "off" = forced.
+    cooling_override: Mapped[Optional[str]] = mapped_column(String(3), nullable=True)
+    # What the device last reported its relay doing ("on" / "off"); None = no relay fitted.
+    cooling_reported: Mapped[Optional[str]] = mapped_column(String(3), nullable=True)
+    # After restocking, HIGH temperature alerts wait until the appliance has pulled down into range.
+    pulldown_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # --- Firmware updates ---
+    target_firmware_id: Mapped[Optional[int]] = mapped_column(ForeignKey("firmware.id", ondelete="SET NULL"),
+                                                              nullable=True)
+    ota_status: Mapped[str] = mapped_column(String(200), default="")
+
     site: Mapped[Site] = relationship(back_populates="devices")
+    target_firmware: Mapped[Optional["Firmware"]] = relationship()
     sensors: Mapped[list["Sensor"]] = relationship(back_populates="device", cascade="all, delete-orphan")
+
+
+class Firmware(Base):
+    """A firmware image uploaded by an admin and offered to devices over the air."""
+    __tablename__ = "firmware"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[str] = mapped_column(String(40), unique=True)
+    filename: Mapped[str] = mapped_column(String(200))
+    size: Mapped[int] = mapped_column(Integer)
+    md5: Mapped[str] = mapped_column(String(32))
+    sha256: Mapped[str] = mapped_column(String(64))
+    notes: Mapped[str] = mapped_column(Text, default="")
+    uploaded_by: Mapped[str] = mapped_column(String(320), default="")
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ApiKey(Base):
+    """Key for a machine client such as the ERP. Only the SHA-256 is stored; the key is shown once."""
+    __tablename__ = "api_keys"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    prefix: Mapped[str] = mapped_column(String(16))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_by: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class StockEvent(Base):
+    """Every stock-state change, from the ERP or the dashboard, for traceability."""
+    __tablename__ = "stock_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"))
+    state: Mapped[str] = mapped_column(String(10))
+    quantity: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    reference: Mapped[str] = mapped_column(String(120), default="")
+    source: Mapped[str] = mapped_column(String(200))      # "erp:<key name>" or "dashboard:<email>"
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Sensor(Base):
@@ -165,11 +227,13 @@ class Notification(Base):
     """Delivery log: one row per message attempted."""
     __tablename__ = "notifications"
     id: Mapped[int] = mapped_column(primary_key=True)
-    alert_id: Mapped[int] = mapped_column(ForeignKey("alerts.id", ondelete="CASCADE"))
+    # Empty for informational messages that belong to no alert (stock empty, cooling switched off, ...).
+    alert_id: Mapped[Optional[int]] = mapped_column(ForeignKey("alerts.id", ondelete="CASCADE"), nullable=True)
+    device_id: Mapped[Optional[int]] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"), nullable=True)
     contact_id: Mapped[Optional[int]] = mapped_column(ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
     channel: Mapped[str] = mapped_column(String(10))
     recipient: Mapped[str] = mapped_column(String(320))
-    event: Mapped[str] = mapped_column(String(20))        # opened | escalated | reminder | resolved
+    event: Mapped[str] = mapped_column(String(20))        # opened | escalated | reminder | resolved | excursion | info
     ok: Mapped[bool] = mapped_column(Boolean)
     provider: Mapped[str] = mapped_column(String(20), default="")
     error: Mapped[str] = mapped_column(Text, default="")

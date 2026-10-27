@@ -51,6 +51,7 @@ const routes = [
   [/^#\/login$/, viewLogin], [/^#\/?$/, viewOverview], [/^#\/sensor\/(\d+)$/, viewSensor],
   [/^#\/alerts$/, viewAlerts], [/^#\/alerts\/(\d+)$/, viewAlert], [/^#\/devices$/, viewDevices],
   [/^#\/contacts$/, viewContacts], [/^#\/audit$/, viewAudit], [/^#\/users$/, viewUsers],
+  [/^#\/integrations$/, viewIntegrations], [/^#\/firmware$/, viewFirmware],
 ];
 
 async function render() {
@@ -172,7 +173,7 @@ async function viewOverview() {
         <div class="grid">${s.devices.map((d) => `
           <div class="panel">
             <div class="device-head"><span class="name">${esc(d.name)}</span><span class="meta">${esc(d.serial)}</span></div>
-            <div class="chips">${deviceChips(d)}</div>
+            <div class="chips">${deviceChips(d)}${stockChips(d)}</div>
             ${d.sensors.map((x) => sensorTile(x, d.online)).join("") || `<p class="muted">Waiting for first reading…</p>`}
             <div class="meta" style="margin-top:8px">Last data ${ago(d.last_seen_at)} · every ${d.interval_seconds}s</div>
           </div>`).join("") || `<p class="muted">No devices at this site.</p>`}
@@ -200,7 +201,9 @@ async function viewSensor(id) {
       <div class="row"><h1 style="margin:0">${esc(s.label)}</h1><span class="meta">${esc(report.site)} / ${esc(report.device)} · ${esc(s.kind)}</span>
         <span class="spacer"></span>
         ${Object.keys(ranges).map((r) => `<button class="${r === range ? "" : "secondary"}" data-range="${r}">${r}</button>`).join("")}
-        <button class="secondary" id="csv">Export CSV</button></div>
+        <button class="secondary" id="csv">Export CSV</button><button class="secondary" onclick="window.print()">Print / PDF</button></div>
+      <div class="print-only"><p>Temperature record — ${esc(report.site)} / ${esc(report.device)} / ${esc(s.label)}<br>
+        Period ${fmtTime(start.toISOString())} – ${fmtTime(end.toISOString())} · limits ${s.min_value ?? "—"} … ${s.max_value ?? "—"} ${esc(s.unit)} · printed ${fmtTime(new Date().toISOString())} by ${esc(state.user.email)}</p></div>
       <div class="panel" style="margin-top:12px"><div class="chart-box"><canvas id="chart"></canvas></div></div>
       <h2>Summary for this period</h2>
       <div class="panel stats">${sum.count ? `
@@ -213,8 +216,9 @@ async function viewSensor(id) {
         <div><b>${sum.count}</b><span>readings</span></div>` : `<p class="muted">No readings in this period.</p>`}</div>
       <h2>Excursions in this period</h2>
       <div class="panel">${alertTable(report.excursions, false)}</div>
-      ${isAdmin() ? `<h2>Alert limits</h2>
-      <form class="panel inline" id="limits">
+      <div class="print-only signoff"><span>Reviewed by: ____________________</span><span>Signature / date: ____________________</span></div>
+      ${isAdmin() ? `<h2 class="no-print">Alert limits</h2>
+      <form class="panel inline no-print" id="limits">
         <label>Label <input name="label" value="${esc(s.label)}"></label>
         <label>Type <select name="kind">${["temperature", "humidity", "other"].map((k) => `<option ${k === s.kind ? "selected" : ""}>${k}</option>`).join("")}</select></label>
         <label>Unit <input name="unit" value="${esc(s.unit)}" size="4"></label>
@@ -224,7 +228,7 @@ async function viewSensor(id) {
         <label class="checks"><input type="checkbox" name="enabled" ${s.enabled ? "checked" : ""}> Alerts on</label>
         <button>Save limits</button>
       </form>
-      <p class="meta">Typical: vaccines / fridges 2…8 °C · freezers −25…−15 °C · ambient pharma store 15…25 °C, humidity ≤ 60 % · server room 18…27 °C, humidity 20…80 %.</p>` : ""}`;
+      <p class="meta no-print">Typical: vaccines / fridges 2…8 °C · freezers −25…−15 °C · ambient pharma store 15…25 °C, humidity ≤ 60 % · server room 18…27 °C, humidity 20…80 %.</p>` : ""}`;
 
     const pts = data.points.map(([t, v]) => ({ x: new Date(t).getTime(), y: v }));
     const lines = [];
@@ -320,9 +324,43 @@ async function viewAlert(id) {
 
 // --- Sites & devices -----------------------------------------------------------------------------------------
 
+function stockChips(d) {
+  const c = [];
+  if (d.stock_state === "EMPTY") c.push(`<span class="chip warn">stock empty</span>`);
+  else if (d.stock_state === "STOCKED") c.push(`<span class="chip ok">stocked</span>`);
+  if (d.cooling_reported || d.cooling_command === "off" || d.cooling_mode !== "auto") {
+    const pending = d.cooling_reported && d.cooling_reported !== d.cooling_command;
+    c.push(`<span class="chip ${d.cooling_command === "off" ? "warn" : "ok"}">cooling ${d.cooling_command}${pending ? " (pending)" : ""}${d.cooling_mode !== "auto" ? " · forced" : ""}</span>`);
+  }
+  if (d.stock_state === "EMPTY" && d.cooling_command === "on" && d.cooling_off_at) c.push(`<span class="chip">off at ${fmtTime(d.cooling_off_at)}</span>`);
+  if (d.pulldown_until) c.push(`<span class="chip">cooling down after restock</span>`);
+  return c.join("");
+}
+
+function deviceSettings(d, firmware) {
+  return `<details class="settings"><summary>Stock, cooling &amp; firmware settings</summary>
+    <form class="inline" data-settings="${d.id}">
+      <label>ERP code <input name="erp_code" value="${esc(d.erp_code)}" placeholder="e.g. WH1-FRIDGE-03"></label>
+      <label class="checks"><input type="checkbox" name="auto_cooling_off" ${d.auto_cooling_off ? "checked" : ""}> Switch cooling off when empty</label>
+      <label class="checks"><input type="checkbox" name="share_data_when_empty" ${d.share_data_when_empty ? "checked" : ""}> Keep recording while empty</label>
+      <label>Cooling <select name="cooling_mode">${["auto", "on", "off"].map((m) => `<option value="${m}" ${m === d.cooling_mode ? "selected" : ""}>${m === "auto" ? "automatic (by stock)" : "force " + m}</option>`).join("")}</select></label>
+      <label>Firmware target <select name="target_firmware_id"><option value="0">none</option>${firmware.map((f) => `<option value="${f.id}" ${f.version === d.target_firmware ? "selected" : ""}>${esc(f.version)}</option>`).join("")}</select></label>
+      <button>Save</button>
+    </form>
+    <div class="row" style="margin-top:10px">
+      <span class="muted">Stock: <b>${esc(d.stock_state.toLowerCase())}</b>${d.stock_updated_at ? " since " + fmtTime(d.stock_updated_at) : ""}</span>
+      <button class="secondary" data-stock="${d.id}" data-state="empty">Mark empty</button>
+      <button class="secondary" data-stock="${d.id}" data-state="stocked">Mark stocked</button>
+      <button class="link" data-history="${d.id}">history</button>
+      ${d.ota_status ? `<span class="meta">OTA: ${esc(d.ota_status)}</span>` : ""}
+    </div>
+    <div data-history-slot="${d.id}"></div>
+  </details>`;
+}
+
 async function viewDevices() {
-  const o = await api("/api/overview");
   const admin = isAdmin();
+  const [o, firmware] = await Promise.all([api("/api/overview"), admin ? api("/api/firmware") : []]);
   $app.innerHTML = `
     <h1>Sites &amp; devices</h1>
     <div id="secret"></div>
@@ -332,22 +370,24 @@ async function viewDevices() {
       <button>Add site</button></form>` : ""}
     ${o.sites.map((s) => `
       <h2>${esc(s.name)} ${admin ? `<button class="link" data-del-site="${s.id}">delete</button>` : ""}</h2>
-      <div class="panel table-wrap">
-        <table><tr><th>Device</th><th>Serial</th><th>Status</th><th>Interval</th><th>Firmware</th>${admin ? "<th></th>" : ""}</tr>
-        ${s.devices.map((d) => `<tr>
-          <td>${esc(d.name)}</td><td><code>${esc(d.serial)}</code></td><td>${deviceChips(d)}<div class="meta">${ago(d.last_seen_at)}</div></td>
-          <td>${admin ? `<select data-interval="${d.id}">${[10, 30, 60, 120, 300, 600, 900].map((v) => `<option value="${v}" ${v === d.interval_seconds ? "selected" : ""}>${v < 60 ? v + " s" : v / 60 + " min"}</option>`).join("")}</select>` : `${d.interval_seconds}s`}</td>
-          <td>${esc(d.firmware) || "—"}</td>
-          ${admin ? `<td class="row"><button class="secondary" data-rotate="${d.id}">New key</button><button class="danger" data-del-dev="${d.id}">Delete</button></td>` : ""}
-        </tr>`).join("")}</table>
-        ${admin ? `<form class="inline" data-dev-form="${s.id}" style="margin-top:12px">
-          <label>New device name <input name="name" required placeholder="Cold Room 1 / Server Rack A"></label>
-          <button>Add device</button></form>` : ""}
-      </div>`).join("")}`;
+      <div class="grid wide">
+        ${s.devices.map((d) => `<div class="panel">
+          <div class="device-head"><span class="name">${esc(d.name)}</span><code>${esc(d.serial)}</code></div>
+          <div class="chips">${deviceChips(d)}${stockChips(d)}</div>
+          <div class="row meta">Last data ${ago(d.last_seen_at)} · firmware ${esc(d.firmware) || "—"}${d.erp_code ? " · ERP " + esc(d.erp_code) : ""}
+            <span class="spacer"></span>
+            ${admin ? `<label class="checks">every <select data-interval="${d.id}">${[10, 30, 60, 120, 300, 600, 900].map((v) => `<option value="${v}" ${v === d.interval_seconds ? "selected" : ""}>${v < 60 ? v + " s" : v / 60 + " min"}</option>`).join("")}</select></label>` : `every ${d.interval_seconds}s`}
+          </div>
+          ${admin ? deviceSettings(d, firmware) + `<div class="row" style="margin-top:10px"><button class="secondary" data-rotate="${d.id}">New key</button><button class="danger" data-del-dev="${d.id}">Delete</button></div>` : ""}
+        </div>`).join("") || `<p class="muted">No devices at this site.</p>`}
+      </div>
+      ${admin ? `<form class="inline" data-dev-form="${s.id}" style="margin-top:12px">
+        <label>New device name <input name="name" required placeholder="Cold Room 1 / Server Rack A"></label>
+        <button>Add device</button></form>` : ""}`).join("")}`;
 
   const showSecret = (serial, secret) => {
     document.getElementById("secret").innerHTML = `<div class="panel" style="margin-bottom:16px">
-      <b>Device credentials — copy them now, the key is shown only once.</b>
+      <b>Device credentials: copy them now. The key is shown only once.</b>
       <div class="secret">Serial: ${esc(serial)}\nKey:    ${esc(secret)}\nServer: ${esc(location.origin)}</div>
       <p class="meta">Power on the device; it opens a Wi-Fi network named <b>ColdChain-Setup</b>. Connect with your phone, choose the site's Wi-Fi and enter the server, serial and key above.</p></div>`;
     window.scrollTo(0, 0);
@@ -368,6 +408,27 @@ async function viewDevices() {
   $app.querySelectorAll("[data-interval]").forEach((sel) => (sel.onchange = async () => {
     try { await api(`/api/devices/${sel.dataset.interval}`, { method: "PATCH", body: { interval_seconds: Number(sel.value) } }); toast("Interval saved; the device picks it up on its next upload"); } catch (err) { toast(err.message); }
   }));
+  $app.querySelectorAll("[data-settings]").forEach((f) => (f.onsubmit = async (e) => {
+    e.preventDefault(); const fd = new FormData(f);
+    const body = { erp_code: fd.get("erp_code"), auto_cooling_off: fd.get("auto_cooling_off") === "on",
+      share_data_when_empty: fd.get("share_data_when_empty") === "on", cooling_mode: fd.get("cooling_mode"),
+      target_firmware_id: Number(fd.get("target_firmware_id")) };
+    if (body.cooling_mode === "off" && !confirm("Force cooling OFF regardless of stock? Only do this for an empty appliance.")) return;
+    try { await api(`/api/devices/${f.dataset.settings}`, { method: "PATCH", body }); toast("Saved"); reload(); } catch (err) { toast(err.message); }
+  }));
+  $app.querySelectorAll("[data-stock]").forEach((b) => (b.onclick = async () => {
+    const note = prompt(`Mark as ${b.dataset.state}? Reference / reason (recorded):`, "");
+    if (note === null) return;
+    try {
+      const r = await api(`/api/devices/${b.dataset.stock}/stock`, { method: "POST", body: { state: b.dataset.state, note } });
+      toast(r.warning || `Stock ${r.state}; cooling ${r.cooling}${r.cooling_off_at && r.cooling === "on" ? ", off at " + fmtTime(r.cooling_off_at) : ""}`); reload();
+    } catch (err) { toast(err.message); }
+  }));
+  $app.querySelectorAll("[data-history]").forEach((b) => (b.onclick = async () => {
+    const rows = await api(`/api/devices/${b.dataset.history}/stock-events`);
+    $app.querySelector(`[data-history-slot="${b.dataset.history}"]`).innerHTML = rows.length ? `<table><tr><th>When</th><th>State</th><th>Qty</th><th>Ref</th><th>Source</th></tr>
+      ${rows.map((r) => `<tr><td>${fmtTime(r.at)}</td><td>${esc(r.state)}</td><td>${r.quantity ?? ""}</td><td>${esc(r.reference)}</td><td>${esc(r.source)}</td></tr>`).join("")}</table>` : `<p class="muted">No stock updates yet.</p>`;
+  }));
   $app.querySelectorAll("[data-rotate]").forEach((b) => (b.onclick = async () => {
     if (!confirm("Issue a new key? The device stops reporting until it is set up with the new key.")) return;
     try { const r = await api(`/api/devices/${b.dataset.rotate}/rotate-key`, { method: "POST" }); showSecret(r.serial, r.secret); } catch (err) { toast(err.message); }
@@ -379,6 +440,88 @@ async function viewDevices() {
   $app.querySelectorAll("[data-del-site]").forEach((b) => (b.onclick = async () => {
     if (!confirm("Delete this site?")) return;
     try { await api(`/api/sites/${b.dataset.delSite}`, { method: "DELETE" }); reload(); } catch (err) { toast(err.message); }
+  }));
+}
+
+// --- Integrations (ERP) --------------------------------------------------------------------------------------
+
+async function viewIntegrations() {
+  const keys = await api("/api/api-keys");
+  const origin = esc(location.origin);
+  $app.innerHTML = `
+    <h1>ERP integration</h1>
+    <p class="muted">Your ERP calls this server when a fridge, chiller or cold room runs out of stock, and again when it is restocked.
+      Appliances with <b>Switch cooling off when empty</b> enabled (Sites &amp; devices → settings) turn cooling off after a grace period and back on when restocked.
+      Others are only marked empty, and their temperature alerts pause.</p>
+    <div id="newkey"></div>
+    <form class="panel inline" id="kf"><label>Key name <input name="name" required placeholder="SAP B1 production"></label><button>Create API key</button></form>
+    <div class="panel table-wrap" style="margin-top:12px">${keys.length ? `<table><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>
+      ${keys.map((k) => `<tr style="${k.revoked ? "opacity:.5" : ""}"><td>${esc(k.name)}</td><td><code>${esc(k.prefix)}…</code></td><td>${fmtTime(k.created_at)} · ${esc(k.created_by)}</td><td>${fmtTime(k.last_used_at)}</td>
+        <td>${k.revoked ? "revoked" : `<button class="danger" data-revoke="${k.id}">Revoke</button>`}</td></tr>`).join("")}</table>` : `<p class="muted">No API keys yet.</p>`}</div>
+    <h2>API</h2>
+    <div class="panel"><pre class="code">POST ${origin}/api/erp/stock
+X-API-Key: cck_…
+Content-Type: application/json
+
+{"device": "WH1-FRIDGE-03", "state": "empty", "reference": "GIN-10293"}
+{"device": "CC-7F3A2B", "quantity": 0}                  quantity ≤ 0 means empty
+{"updates": [{"device": "…", "state": "stocked"}, …]}   up to 200 at once
+
+→ {"results": [{"device": "CC-7F3A2B", "state": "empty", "changed": true,
+                "cooling": "on", "cooling_off_at": "…", "device_online": true}]}
+
+GET ${origin}/api/erp/stock      current state and cooling of every appliance</pre>
+      <p class="meta"><b>device</b> is the serial printed on the unit or the ERP code you assign in its settings. Send <b>stocked</b> before goods arrive so the appliance has time to cool down.</p></div>`;
+  document.getElementById("kf").onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const k = await api("/api/api-keys", { method: "POST", body: { name: new FormData(e.target).get("name") } });
+      await viewIntegrations();
+      document.getElementById("newkey").innerHTML = `<div class="panel" style="margin-bottom:12px"><b>Copy this key into the ERP now. It is shown only once.</b><div class="secret">${esc(k.key)}</div></div>`;
+    } catch (err) { toast(err.message); }
+  };
+  $app.querySelectorAll("[data-revoke]").forEach((b) => (b.onclick = async () => {
+    if (!confirm("Revoke this key? The ERP using it will stop working.")) return;
+    try { await api(`/api/api-keys/${b.dataset.revoke}`, { method: "DELETE" }); viewIntegrations(); } catch (err) { toast(err.message); }
+  }));
+}
+
+// --- Firmware (OTA) ------------------------------------------------------------------------------------------
+
+async function viewFirmware() {
+  const list = await api("/api/firmware");
+  $app.innerHTML = `
+    <h1>Firmware updates</h1>
+    <p class="muted">Upload a <code>firmware.bin</code> (from the CI build or <code>pio run</code>) and roll it out. Each device downloads it over Wi-Fi on its next upload, checks the MD5, installs it and restarts.
+      The new image only becomes active once it has downloaded completely with the right MD5; an interrupted download leaves the current firmware running.</p>
+    <form class="panel inline" id="ff">
+      <label>Version <input name="version" required placeholder="0.2.0" pattern="[0-9A-Za-z._-]+"></label>
+      <label>Notes <input name="notes" placeholder="what changed"></label>
+      <label>File <input name="file" type="file" accept=".bin" required></label>
+      <button>Upload</button></form>
+    <div class="panel table-wrap" style="margin-top:12px">${list.length ? `<table><tr><th>Version</th><th>Size</th><th>Uploaded</th><th>Devices</th><th>Notes</th><th></th></tr>
+      ${list.map((f) => `<tr><td><b>${esc(f.version)}</b><div class="meta"><code>${esc(f.sha256.slice(0, 16))}…</code></div></td><td>${(f.size / 1024).toFixed(0)} KB</td>
+        <td>${fmtTime(f.uploaded_at)}<div class="meta">${esc(f.uploaded_by)}</div></td><td>${f.running} running · ${f.targeted} targeted</td><td>${esc(f.notes)}</td>
+        <td class="row"><button data-all="${f.id}">Roll out to all</button><button class="danger" data-del="${f.id}">Delete</button></td></tr>`).join("")}</table>` : `<p class="muted">No firmware uploaded yet.</p>`}</div>
+    <p class="meta">Roll out to one device first (Sites &amp; devices → settings → Firmware target), confirm it reports the new version, then roll out to all.</p>`;
+  document.getElementById("ff").onsubmit = async (e) => {
+    e.preventDefault(); const fd = new FormData(e.target);
+    const file = fd.get("file");
+    try {
+      const res = await fetch(`/api/firmware?version=${encodeURIComponent(fd.get("version"))}&notes=${encodeURIComponent(fd.get("notes"))}`,
+        { method: "POST", body: file, headers: { "Content-Type": "application/octet-stream", Authorization: `Bearer ${state.token}` } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Upload failed");
+      toast(`Uploaded ${data.version}`); viewFirmware();
+    } catch (err) { toast(err.message); }
+  };
+  $app.querySelectorAll("[data-all]").forEach((b) => (b.onclick = async () => {
+    if (!confirm("Offer this firmware to every device?")) return;
+    try { const r = await api(`/api/firmware/${b.dataset.all}/rollout`, { method: "POST", body: { all_devices: true } }); toast(`${r.version} offered to ${r.devices} device(s)`); viewFirmware(); } catch (err) { toast(err.message); }
+  }));
+  $app.querySelectorAll("[data-del]").forEach((b) => (b.onclick = async () => {
+    if (!confirm("Delete this firmware? Devices targeting it stop being offered an update.")) return;
+    try { await api(`/api/firmware/${b.dataset.del}`, { method: "DELETE" }); viewFirmware(); } catch (err) { toast(err.message); }
   }));
 }
 

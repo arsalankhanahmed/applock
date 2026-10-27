@@ -80,3 +80,17 @@ button:disabled { opacity: .5; cursor: default; }
   color: var(--bg); padding: 10px 16px; border-radius: 8px; z-index: 10; max-width: 90vw; }
 .badge { background: var(--bad); color: #fff; border-radius: 99px; padding: 0 7px; font-size: 12px; }
 @media (max-width: 600px) { .topbar { gap: 10px; } .who { width: 100%; } }
+.grid.wide { grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+details.settings { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+details.settings summary { cursor: pointer; color: var(--accent); font-size: 14px; margin-bottom: 10px; }
+pre.code { background: var(--bg); padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px; margin: 0; }
+.print-only { display: none; }
+@media (max-width: 400px) { .grid.wide { grid-template-columns: 1fr; } }
+@media print {
+  :root { --bg: #fff; --panel: #fff; --text: #000; --muted: #444; --line: #bbb; }
+  .topbar, button, .no-print, #toast { display: none !important; }
+  .print-only { display: block; }
+  .signoff { display: flex; justify-content: space-between; margin-top: 40px; }
+  main { max-width: none; padding: 0; }
+  .panel { border-color: #bbb; break-inside: avoid; }
+}

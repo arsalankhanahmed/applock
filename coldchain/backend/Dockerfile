@@ -9,6 +9,6 @@ COPY tools ./tools
 
 # SQLite lives here unless DATABASE_URL points at PostgreSQL; mount a volume to keep it.
 RUN mkdir -p /data
-ENV DATABASE_URL=sqlite:////data/coldchain.db
+ENV DATABASE_URL=sqlite:////data/coldchain.db FIRMWARE_DIR=/data/firmware
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

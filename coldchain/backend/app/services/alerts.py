@@ -37,8 +37,10 @@ SENSOR_KINDS = ("HIGH", "LOW")
 
 @dataclass(frozen=True)
 class Event:
-    name: str          # opened | escalated | reminder | resolved | excursion
-    alert_id: int
+    name: str          # opened | escalated | reminder | resolved | excursion | info
+    alert_id: int      # 0 for "info" events, which carry their own text and device instead
+    device_id: int = 0
+    text: str = ""
 
 
 # --- Helpers ------------------------------------------------------------------------------------------------
@@ -94,8 +96,17 @@ def process_reading(db: Session, sensor: Sensor, ts: datetime, value: float, now
     if sensor.last_at is not None and ts <= sensor.last_at:
         return []
     sensor.last_value, sensor.last_at = value, ts
+    device = sensor.device
     alert = _active_alert(db, sensor.device_id, SENSOR_KINDS, sensor.id)
-    breach = _breach(sensor, value) if sensor.enabled else None
+    # An empty appliance (cooling may be off on purpose) raises no temperature alerts.
+    breach = _breach(sensor, value) if sensor.enabled and device.stock_state != "EMPTY" else None
+    if device.pulldown_until is not None:
+        if ts >= device.pulldown_until:
+            device.pulldown_until = None
+        elif sensor.kind == "temperature" and breach is None and sensor.enabled:
+            device.pulldown_until = None              # back in range after restocking: normal alerting resumes
+        elif breach is not None and breach[0] == "HIGH":
+            breach = None                             # still cooling down after restocking
     events: list[Event] = []
 
     if breach is None:
@@ -133,7 +144,7 @@ def process_device_status(db: Session, device: Device, mains_power: Optional[boo
     if mains_power is None:
         return events
     power = _active_alert(db, device.id, ("POWER",))
-    if mains_power is False and power is None:
+    if mains_power is False and power is None and device.stock_state != "EMPTY":
         events.append(Event("opened", _open(db, device, "POWER", now, now).id))
     elif mains_power is True and power is not None:
         _resolve(power, now)
@@ -161,8 +172,10 @@ def tick(db: Session, now: Optional[datetime] = None) -> list[Event]:
     now = now or utcnow()
     events: list[Event] = []
 
+    from app.services.stock import effective_interval   # stock imports this module
+
     for device in db.scalars(select(Device).where(Device.last_seen_at.is_not(None))):
-        limit = timedelta(seconds=max(settings.OFFLINE_AFTER_MINUTES * 60, 3 * device.interval_seconds))
+        limit = timedelta(seconds=max(settings.OFFLINE_AFTER_MINUTES * 60, 3 * effective_interval(device)))
         if now - device.last_seen_at > limit and _active_alert(db, device.id, ("OFFLINE",)) is None:
             events.append(Event("opened", _open(db, device, "OFFLINE", device.last_seen_at, now).id))
 
@@ -234,6 +247,29 @@ def build_message(alert: Alert, event: str) -> notify.Message:
     return notify.Message(location=location, summary=summary, body=body, link=link)
 
 
+def _deliver_info(db: Session, event: Event) -> int:
+    """Informational message (stock / cooling changes) to the first contact level of the device's site."""
+    device = db.get(Device, event.device_id)
+    if device is None:
+        return 0
+    contacts = _contacts(db, device.site_id)
+    first = contacts[0].level if contacts else 1
+    msg = notify.Message(location=f"{device.site.name} / {device.name}", summary=event.text, body=event.text,
+                         link=f"{settings.APP_BASE_URL.rstrip('/')}/#/devices")
+    sent = 0
+    for contact in (c for c in contacts if c.level == first):
+        for channel in contact.channel_list:
+            to = contact.email if channel == "email" else contact.phone
+            if channel not in notify.CHANNELS or not to:
+                continue
+            result = notify.send(channel, to, msg)
+            db.add(Notification(alert_id=None, device_id=device.id, contact_id=contact.id, channel=channel,
+                                recipient=notify.mask(to), event="info", ok=result.ok, provider=result.provider,
+                                error=result.error))
+            sent += int(result.ok)
+    return sent
+
+
 def recipients(db: Session, alert: Alert, event: str) -> list[Contact]:
     contacts = _contacts(db, alert.device.site_id)
     if event == "escalated":
@@ -245,6 +281,9 @@ def deliver(db: Session, events: list[Event]) -> int:
     """Send the messages for ``events`` using ``db``; returns how many were sent successfully."""
     sent = 0
     for event in events:
+        if event.name == "info":
+            sent += _deliver_info(db, event)
+            continue
         alert = db.get(Alert, event.alert_id)
         if alert is None:
             continue
@@ -255,8 +294,8 @@ def deliver(db: Session, events: list[Event]) -> int:
                 if channel not in notify.CHANNELS or not to:
                     continue
                 result = notify.send(channel, to, msg)
-                db.add(Notification(alert_id=alert.id, contact_id=contact.id, channel=channel,
-                                    recipient=notify.mask(to), event=event.name, ok=result.ok,
+                db.add(Notification(alert_id=alert.id, device_id=alert.device_id, contact_id=contact.id,
+                                    channel=channel, recipient=notify.mask(to), event=event.name, ok=result.ok,
                                     provider=result.provider, error=result.error))
                 sent += int(result.ok)
         alert.last_notified_at = utcnow()

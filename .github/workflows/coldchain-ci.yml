@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        env: [esp32dev, esp32s3, esp32dev-sim]
+        env: [esp32dev, esp32s3, esp32dev-sim, esp32dev-4g]
     defaults:
       run:
         working-directory: coldchain/firmware

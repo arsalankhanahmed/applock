@@ -181,3 +181,139 @@ def test_unsynced_clock_uses_uptime_from_same_boot(client, device):
     from datetime import datetime
     stamps = sorted(datetime.fromisoformat(t[:-1]) for t, _ in points)
     assert 595 <= (stamps[1] - stamps[0]).total_seconds() <= 605      # 600 s before upload vs. "now"
+
+
+# --- Stock-aware cooling control & ERP integration -----------------------------------------------------------
+
+def erp_key(client):
+    return client.post("/api/api-keys", json={"name": "SAP B1"}).json()["key"]
+
+
+def test_erp_requires_valid_key(client, device):
+    assert client.post("/api/erp/stock", json={"device": device["serial"], "state": "empty"}).status_code == 401
+    key = erp_key(client)
+    kid = client.get("/api/api-keys").json()[0]["id"]
+    client.delete(f"/api/api-keys/{kid}")
+    r = client.post("/api/erp/stock", json={"device": device["serial"], "state": "empty"}, headers={"X-API-Key": key})
+    assert r.status_code == 401
+
+
+def test_stock_empty_pauses_alerts_and_switches_cooling_off_after_delay(client, device):
+    post(client, device, [{"ts": int(time.time()) - 600, "values": {"temp": 5.0}}], cooling="on")
+    sid = sensor_id(client, device)
+    client.patch(f"/api/sensors/{sid}", json={"min_value": 2, "max_value": 8, "delay_minutes": 0})
+    client.post("/api/contacts", json={"name": "Store", "email": "store@test.local", "level": 1})
+    client.patch(f"/api/devices/{device['id']}", json={"erp_code": "WH1-FRIDGE-03", "auto_cooling_off": True})
+    post(client, device, [{"ts": int(time.time()) - 540, "values": {"temp": 9.5}}])
+    assert len(client.get("/api/alerts?status=active").json()) == 1
+
+    key = erp_key(client)
+    r = client.post("/api/erp/stock", headers={"X-API-Key": key},
+                    json={"device": "WH1-FRIDGE-03", "quantity": 0, "reference": "GIN-1"})
+    res = r.json()["results"][0]
+    assert r.status_code == 200 and res["state"] == "empty" and res["changed"]
+    assert res["cooling"] == "on" and res["cooling_off_at"]          # grace period before switching off
+    assert client.get("/api/alerts?status=active").json() == []       # open HIGH alert closed
+
+    # Warming up while empty raises no alert; device still gets "on" during the grace period.
+    body = post(client, device, [{"ts": int(time.time()) - 480, "values": {"temp": 14.0}}]).json()
+    assert body["cooling"] == "on" and body["sensors"] == {}
+    assert client.get("/api/alerts?status=active").json() == []
+
+    with session_scope() as db:                                      # grace period over
+        db.get(Device, device["id"]).stock_updated_at = utcnow() - timedelta(minutes=31)
+    body = post(client, device, [{"ts": int(time.time()) - 420, "values": {"temp": 15.0}}], cooling="off").json()
+    assert body["cooling"] == "off"
+
+    with session_scope() as db:
+        info = [n.event for n in db.query(Notification).filter_by(device_id=device["id"], event="info")]
+    assert len(info) == 2                                            # "stock empty" and "cooling switched off"
+
+    events = client.get(f"/api/devices/{device['id']}/stock-events").json()
+    assert events[0]["state"] == "EMPTY" and events[0]["reference"] == "GIN-1"
+
+
+def test_restock_turns_cooling_on_and_waits_for_pulldown(client, device):
+    post(client, device, [{"ts": int(time.time()) - 900, "values": {"temp": 5.0}}])
+    sid = sensor_id(client, device)
+    client.patch(f"/api/sensors/{sid}", json={"min_value": 2, "max_value": 8, "delay_minutes": 0})
+    client.patch(f"/api/devices/{device['id']}", json={"auto_cooling_off": True})
+    key = erp_key(client)
+    client.post("/api/erp/stock", headers={"X-API-Key": key}, json={"device": device["serial"], "state": "empty"})
+    with session_scope() as db:
+        db.get(Device, device["id"]).stock_updated_at = utcnow() - timedelta(hours=2)
+    assert post(client, device, [{"ts": int(time.time()) - 800, "values": {"temp": 18}}]).json()["cooling"] == "off"
+
+    r = client.post("/api/erp/stock", headers={"X-API-Key": key},
+                    json={"updates": [{"device": device["serial"], "state": "stocked"}, {"device": "nope", "state": "empty"}]})
+    ok, bad = r.json()["results"]
+    assert ok["cooling"] == "on" and bad["error"]
+    # Still warm after restocking: no HIGH alert during pull-down.
+    body = post(client, device, [{"ts": int(time.time()) - 700, "values": {"temp": 12}}]).json()
+    assert body["cooling"] == "on" and body["sensors"]["temp"]["max"] == 8
+    assert client.get("/api/alerts?status=active").json() == []
+    # Back in range ends pull-down; the next excursion alerts normally.
+    post(client, device, [{"ts": int(time.time()) - 600, "values": {"temp": 6}}])
+    post(client, device, [{"ts": int(time.time()) - 500, "values": {"temp": 10}}])
+    assert [a["kind"] for a in client.get("/api/alerts?status=active").json()] == ["HIGH"]
+
+
+def test_cooling_stays_on_without_opt_in_and_override_wins(client, device):
+    post(client, device, [{"values": {"temp": 5.0}}])
+    key = erp_key(client)
+    client.post("/api/erp/stock", headers={"X-API-Key": key}, json={"device": device["serial"], "state": "empty"})
+    with session_scope() as db:
+        db.get(Device, device["id"]).stock_updated_at = utcnow() - timedelta(hours=5)
+    assert post(client, device, []).json()["cooling"] == "on"          # auto_cooling_off not enabled
+    client.patch(f"/api/devices/{device['id']}", json={"cooling_mode": "off"})
+    assert post(client, device, []).json()["cooling"] == "off"
+    client.patch(f"/api/devices/{device['id']}", json={"cooling_mode": "auto"})
+    assert post(client, device, []).json()["cooling"] == "on"
+
+
+def test_empty_without_data_sharing_sends_heartbeat_only(client, device):
+    post(client, device, [{"values": {"temp": 5.0}}])
+    client.patch(f"/api/devices/{device['id']}", json={"share_data_when_empty": False})
+    client.post(f"/api/devices/{device['id']}/stock", json={"state": "empty", "note": "audit test"})
+    body = post(client, device, [{"values": {"temp": 20.0}}]).json()
+    assert body["record"] is False and body["stored"] == 0 and body["interval_seconds"] == 900
+    dev = client.get(f"/api/devices/{device['id']}").json()
+    assert dev["online"] and dev["stock_state"] == "EMPTY" and not dev["recording"]
+    with session_scope() as db:                                       # heartbeat interval governs OFFLINE
+        db.get(Device, device["id"]).last_seen_at = utcnow() - timedelta(minutes=20)
+        assert engine.tick(db) == []
+
+
+def test_power_alert_suppressed_while_empty(client, device):
+    client.post(f"/api/devices/{device['id']}/stock", json={"state": "empty"})
+    post(client, device, [], mains_power=False)
+    assert client.get("/api/alerts?status=active").json() == []
+
+
+def test_erp_code_must_be_unique(client, device):
+    site = device["site"]["id"]
+    other = client.post("/api/devices", json={"site_id": site, "name": "Freezer"}).json()
+    client.patch(f"/api/devices/{device['id']}", json={"erp_code": "BIN-1"})
+    assert client.patch(f"/api/devices/{other['id']}", json={"erp_code": "BIN-1"}).status_code == 409
+
+
+# --- Firmware updates ----------------------------------------------------------------------------------------
+
+def test_firmware_upload_rollout_and_download(client, device):
+    image = bytes([0xE9]) + b"\x00" * 4095
+    assert client.post("/api/firmware?version=0.2.0", content=b"not firmware" * 200).status_code == 422
+    fw = client.post("/api/firmware?version=0.2.0", content=image,
+                     headers={"Content-Type": "application/octet-stream"}).json()
+    assert fw["size"] == 4096 and len(fw["md5"]) == 32
+    # Not assigned yet: no offer, and the device may not download it.
+    assert "ota" not in post(client, device, [], firmware="0.1.0").json()
+    assert client.get(f"/api/device/firmware/{fw['id']}.bin", headers=device["headers"]).status_code == 403
+    client.post(f"/api/firmware/{fw['id']}/rollout", json={"device_ids": [device["id"]]})
+    ota = post(client, device, [], firmware="0.1.0").json()["ota"]
+    assert ota["version"] == "0.2.0" and ota["md5"] == fw["md5"]
+    blob = client.get(ota["url"], headers=device["headers"])
+    assert blob.status_code == 200 and blob.content == image
+    post(client, device, [], firmware="0.2.0")
+    dev = client.get(f"/api/devices/{device['id']}").json()
+    assert dev["ota_status"] == "updated to 0.2.0"
+    assert "ota" not in post(client, device, [], firmware="0.2.0").json()

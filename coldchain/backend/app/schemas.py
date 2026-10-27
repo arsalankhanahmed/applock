@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.services.notify import CHANNELS, normalise_phone
 
@@ -27,6 +27,10 @@ class IngestIn(BaseModel):
     network: Optional[str] = Field(default=None, max_length=20)
     uptime_ms: Optional[int] = None
     boot: Optional[int] = None
+    # What the cooling relay is doing right now; absent when no relay is fitted.
+    cooling: Optional[str] = Field(default=None, pattern="^(on|off)$")
+    # Set by the device when an over-the-air update failed.
+    ota_error: Optional[str] = Field(default=None, max_length=200)
 
 
 class LoginIn(BaseModel):
@@ -56,6 +60,46 @@ class DevicePatch(BaseModel):
     site_id: Optional[int] = None
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
     interval_seconds: Optional[int] = Field(default=None, ge=10, le=3600)
+    erp_code: Optional[str] = Field(default=None, max_length=64)        # "" clears it
+    auto_cooling_off: Optional[bool] = None
+    share_data_when_empty: Optional[bool] = None
+    cooling_mode: Optional[str] = Field(default=None, pattern="^(auto|on|off)$")
+    target_firmware_id: Optional[int] = None                             # 0 clears it
+
+
+class StockIn(BaseModel):
+    """One stock update from the ERP. Give ``state``, or ``quantity`` (0 or less means empty)."""
+    device: str = Field(min_length=1, max_length=64, description="Device serial (CC-XXXXXX) or its ERP code")
+    state: Optional[str] = Field(default=None, pattern="^(?i)(empty|stocked)$")
+    quantity: Optional[float] = None
+    reference: str = Field(default="", max_length=120)
+
+    @model_validator(mode="after")
+    def _state_from_quantity(self):
+        if self.state is None:
+            if self.quantity is None:
+                raise ValueError("give either state ('empty' / 'stocked') or quantity")
+            self.state = "empty" if self.quantity <= 0 else "stocked"
+        self.state = self.state.upper()
+        return self
+
+
+class ErpStockIn(BaseModel):
+    updates: list[StockIn] = Field(min_length=1, max_length=200)
+
+
+class ManualStockIn(BaseModel):
+    state: str = Field(pattern="^(?i)(empty|stocked)$")
+    note: str = Field(default="", max_length=120)
+
+
+class ApiKeyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class RolloutIn(BaseModel):
+    device_ids: list[int] = Field(default_factory=list)
+    all_devices: bool = False
 
 
 class SensorPatch(BaseModel):

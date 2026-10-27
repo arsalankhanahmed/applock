@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import logging
+import secrets
 import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,14 +22,15 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import (Alert, AuditLog, Contact, Device, Notification, Reading, Sensor, Site, User, audit,
-                          get_db, init_db, session_scope, utcnow)
-from app.schemas import (ContactIn, DeviceIn, DevicePatch, IngestIn, LoginIn, NoteIn, SensorPatch, SiteIn,
-                         UserIn)
+from app.database import (Alert, ApiKey, AuditLog, Contact, Device, Firmware, Notification, Reading, Sensor, Site,
+                          StockEvent, User, audit, get_db, init_db, session_scope, utcnow)
+from app.schemas import (ApiKeyIn, ContactIn, DeviceIn, DevicePatch, ErpStockIn, IngestIn, LoginIn,
+                         ManualStockIn, NoteIn, RolloutIn, SensorPatch, SiteIn, StockIn, UserIn)
 from app.security import (admin_user, create_token, current_device, current_user, hash_password, hash_secret,
                           new_device_credentials, verify_password)
 from app.services import alerts as engine
 from app.services import notify
+from app.services import stock
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("coldchain")
@@ -99,7 +102,7 @@ def parse_time(value: Optional[str], default: datetime) -> datetime:
 def device_online(device: Device, now: datetime) -> bool:
     if device.last_seen_at is None:
         return False
-    limit = max(settings.OFFLINE_AFTER_MINUTES * 60, 3 * device.interval_seconds)
+    limit = max(settings.OFFLINE_AFTER_MINUTES * 60, 3 * stock.effective_interval(device))
     return (now - device.last_seen_at).total_seconds() <= limit
 
 
@@ -127,6 +130,13 @@ def device_out(d: Device, now: datetime) -> dict:
             "interval_seconds": d.interval_seconds, "last_seen_at": iso(d.last_seen_at),
             "online": device_online(d, now), "firmware": d.firmware, "rssi": d.rssi, "battery_pct": d.battery_pct,
             "mains_power": d.mains_power, "network": d.network,
+            "erp_code": d.erp_code, "stock_state": d.stock_state, "stock_updated_at": iso(d.stock_updated_at),
+            "auto_cooling_off": d.auto_cooling_off, "share_data_when_empty": d.share_data_when_empty,
+            "cooling_mode": d.cooling_override or "auto", "cooling_command": stock.cooling_command(d, now),
+            "cooling_off_at": iso(stock.cooling_off_at(d)), "cooling_reported": d.cooling_reported,
+            "pulldown_until": iso(d.pulldown_until), "recording": stock.recording(d),
+            "target_firmware": d.target_firmware.version if d.target_firmware else None,
+            "ota_status": d.ota_status,
             "sensors": [sensor_out(s) for s in sorted(d.sensors, key=lambda s: s.id)]}
 
 
@@ -194,6 +204,8 @@ def ingest(body: IngestIn, background: BackgroundTasks, device: Device = Depends
             ts = now_ts
         rows.append((min(ts, now_ts), r.values))
     rows.sort(key=lambda row: row[0])
+    if not stock.recording(device):
+        rows = []                                         # empty appliance with data sharing off: heartbeat only
 
     seen: set[tuple[int, datetime]] = set()
     for ts_int, values in rows:
@@ -224,12 +236,31 @@ def ingest(body: IngestIn, background: BackgroundTasks, device: Device = Depends
         value = getattr(body, field)
         if value is not None:
             setattr(device, field, value)
+    if body.cooling is not None and body.cooling != device.cooling_reported:
+        if device.cooling_reported is not None:             # not on the very first report
+            word = "switched OFF" if body.cooling == "off" else "switched back ON"
+            events.append(engine.Event("info", 0, device_id=device.id,
+                                       text=f"COOLING {word}: {device.site.name} / {device.name} "
+                                            f"(stock {device.stock_state.lower()})."))
+        audit(db, f"device:{device.serial}", "device.cooling", f"relay {body.cooling}")
+        device.cooling_reported = body.cooling
+    if body.ota_error:
+        device.ota_status = f"failed: {body.ota_error}"
+    elif device.target_firmware and body.firmware == device.target_firmware.version:
+        device.ota_status = f"updated to {body.firmware}"
     events += engine.process_device_status(db, device, body.mains_power, now)
     db.commit()
     background.add_task(engine.dispatch, engine.collapse(events))
 
-    return {"stored": stored, "server_time": now_ts, "interval_seconds": device.interval_seconds,
-            "sensors": {s.key: {"min": s.min_value, "max": s.max_value} for s in sensors.values() if s.enabled}}
+    response = {"stored": stored, "server_time": now_ts, "interval_seconds": stock.effective_interval(device),
+                "record": stock.recording(device), "cooling": stock.cooling_command(device, now),
+                "sensors": {s.key: {"min": s.min_value, "max": s.max_value} for s in sensors.values()
+                            if s.enabled and device.stock_state != "EMPTY"}}
+    target = device.target_firmware
+    if target and body.firmware and body.firmware != target.version:
+        response["ota"] = {"version": target.version, "url": f"/api/device/firmware/{target.id}.bin",
+                           "size": target.size, "md5": target.md5}
+    return response
 
 
 @app.post("/api/internal/tick")
@@ -370,9 +401,25 @@ def update_device(device_id: int, body: DevicePatch, admin: User = Depends(admin
     changes = body.model_dump(exclude_none=True)
     if "site_id" in changes:
         _get(db, Site, changes["site_id"])
+    if "erp_code" in changes:
+        code = changes["erp_code"].strip() or None
+        if code and db.scalars(select(Device).where(Device.erp_code == code, Device.id != device.id)).first():
+            raise HTTPException(409, f"ERP code {code} is already used by another device")
+        changes["erp_code"] = code
+    if "cooling_mode" in changes:
+        mode = changes.pop("cooling_mode")
+        changes["cooling_override"] = None if mode == "auto" else mode
+    if "target_firmware_id" in changes:
+        if changes["target_firmware_id"] == 0:
+            changes["target_firmware_id"] = None
+        else:
+            _get(db, Firmware, changes["target_firmware_id"])
+        device.ota_status = ""
     for field, value in changes.items():
-        audit(db, admin.email, "device.update", f"{device.serial} {field}: {getattr(device, field)!r} -> {value!r}")
-        setattr(device, field, value)
+        if getattr(device, field) != value:
+            audit(db, admin.email, "device.update",
+                  f"{device.serial} {field}: {getattr(device, field)!r} -> {value!r}")
+            setattr(device, field, value)
     db.commit()
     db.refresh(device)
     return device_out(device, utcnow())
@@ -395,6 +442,195 @@ def delete_device(device_id: int, admin: User = Depends(admin_user), db: Session
     db.delete(device)
     db.commit()
     return {"ok": True}
+
+
+# --- Stock & ERP integration --------------------------------------------------------------------------------
+
+def _apply_stock(db: Session, device: Device, state: str, source: str, reference: str = "",
+                 quantity: Optional[float] = None) -> tuple[dict, list[engine.Event]]:
+    now = utcnow()
+    online = device_online(device, now)
+    changed, events = stock.set_state(db, device, state, now, source, reference, quantity, online)
+    result = {"device": device.serial, "erp_code": device.erp_code, "name": device.name,
+              "state": device.stock_state.lower(), "changed": changed,
+              "cooling": stock.cooling_command(device, now), "cooling_off_at": iso(stock.cooling_off_at(device)),
+              "device_online": online}
+    if not online:
+        result["warning"] = "Device is offline; it will apply the command when it reconnects."
+    return result, events
+
+
+@app.post("/api/devices/{device_id}/stock")
+def set_stock_manually(device_id: int, body: ManualStockIn, background: BackgroundTasks,
+                       admin: User = Depends(admin_user), db: Session = Depends(get_db)) -> dict:
+    device = _get(db, Device, device_id)
+    result, events = _apply_stock(db, device, body.state, f"dashboard:{admin.email}", body.note)
+    audit(db, admin.email, "stock.set", f"{device.serial} -> {body.state.upper()} {body.note}")
+    db.commit()
+    background.add_task(engine.dispatch, events)
+    return result
+
+
+@app.get("/api/devices/{device_id}/stock-events")
+def stock_events(device_id: int, _: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    _get(db, Device, device_id)
+    rows = db.scalars(select(StockEvent).where(StockEvent.device_id == device_id)
+                      .order_by(StockEvent.id.desc()).limit(100))
+    return [{"at": iso(e.at), "state": e.state, "quantity": e.quantity, "reference": e.reference,
+             "source": e.source} for e in rows]
+
+
+def erp_client(x_api_key: str = Header(default=""), db: Session = Depends(get_db)) -> ApiKey:
+    key = db.scalars(select(ApiKey).where(ApiKey.key_hash == hash_secret(x_api_key),
+                                          ApiKey.revoked.is_(False))).first() if x_api_key else None
+    if key is None:
+        raise HTTPException(401, "Missing or invalid X-API-Key")
+    key.last_used_at = utcnow()
+    return key
+
+
+def _find_device(db: Session, ref: str) -> Optional[Device]:
+    ref = ref.strip()
+    return db.scalars(select(Device).where((Device.serial == ref) | (Device.erp_code == ref))).first()
+
+
+@app.post("/api/erp/stock")
+def erp_stock(body: Union[ErpStockIn, StockIn], background: BackgroundTasks, key: ApiKey = Depends(erp_client),
+              db: Session = Depends(get_db)) -> dict:
+    """The ERP reports that a fridge / cold room is empty or stocked again.
+
+    Header: X-API-Key: <key from Integrations>
+    Body:   {"device": "WH1-FRIDGE-03", "state": "empty", "reference": "GIN-10293"}
+            or {"device": "CC-7F3A2B", "quantity": 0}
+            or {"updates": [{...}, {...}]}  (up to 200)
+    """
+    updates = body.updates if isinstance(body, ErpStockIn) else [body]
+    results, events = [], []
+    for u in updates:
+        device = _find_device(db, u.device)
+        if device is None:
+            results.append({"device": u.device, "error": "unknown device or ERP code"})
+            continue
+        result, ev = _apply_stock(db, device, u.state, f"erp:{key.name}", u.reference, u.quantity)
+        results.append(result)
+        events += ev
+        audit(db, f"erp:{key.name}", "stock.set", f"{device.serial} -> {u.state} {u.reference}")
+    db.commit()
+    background.add_task(engine.dispatch, events)
+    return {"results": results}
+
+
+@app.get("/api/erp/stock")
+def erp_stock_status(_: ApiKey = Depends(erp_client), db: Session = Depends(get_db)) -> dict:
+    now = utcnow()
+    db.commit()                                           # keep last_used_at
+    return {"devices": [{"device": d.serial, "erp_code": d.erp_code, "name": d.name, "site": d.site.name,
+                         "state": d.stock_state.lower(), "cooling": stock.cooling_command(d, now),
+                         "cooling_reported": d.cooling_reported, "device_online": device_online(d, now)}
+                        for d in db.scalars(select(Device).order_by(Device.id))]}
+
+
+@app.get("/api/api-keys")
+def list_api_keys(_: User = Depends(admin_user), db: Session = Depends(get_db)) -> list[dict]:
+    return [{"id": k.id, "name": k.name, "prefix": k.prefix, "created_by": k.created_by,
+             "created_at": iso(k.created_at), "last_used_at": iso(k.last_used_at), "revoked": k.revoked}
+            for k in db.scalars(select(ApiKey).order_by(ApiKey.id.desc()))]
+
+
+@app.post("/api/api-keys")
+def create_api_key(body: ApiKeyIn, admin: User = Depends(admin_user), db: Session = Depends(get_db)) -> dict:
+    raw = "cck_" + secrets.token_urlsafe(32)
+    key = ApiKey(name=body.name.strip(), prefix=raw[:10], key_hash=hash_secret(raw), created_by=admin.email)
+    db.add(key)
+    audit(db, admin.email, "apikey.create", key.name)
+    db.commit()
+    return {"id": key.id, "name": key.name, "prefix": key.prefix, "key": raw}     # shown once
+
+
+@app.delete("/api/api-keys/{key_id}")
+def revoke_api_key(key_id: int, admin: User = Depends(admin_user), db: Session = Depends(get_db)) -> dict:
+    key = _get(db, ApiKey, key_id)
+    key.revoked = True
+    audit(db, admin.email, "apikey.revoke", key.name)
+    db.commit()
+    return {"ok": True}
+
+
+# --- Firmware updates (OTA) ---------------------------------------------------------------------------------
+
+def firmware_out(f: Firmware, db: Session) -> dict:
+    targeted = db.scalar(select(func.count(Device.id)).where(Device.target_firmware_id == f.id))
+    running = db.scalar(select(func.count(Device.id)).where(Device.firmware == f.version))
+    return {"id": f.id, "version": f.version, "size": f.size, "md5": f.md5, "sha256": f.sha256, "notes": f.notes,
+            "uploaded_by": f.uploaded_by, "uploaded_at": iso(f.uploaded_at), "targeted": targeted,
+            "running": running}
+
+
+@app.get("/api/firmware")
+def list_firmware(_: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    return [firmware_out(f, db) for f in db.scalars(select(Firmware).order_by(Firmware.id.desc()))]
+
+
+@app.post("/api/firmware")
+async def upload_firmware(request: Request, version: str = Query(min_length=1, max_length=40,
+                                                                 pattern=r"^[0-9A-Za-z._-]+$"),
+                          notes: str = Query("", max_length=500), admin: User = Depends(admin_user),
+                          db: Session = Depends(get_db)) -> dict:
+    """Upload a firmware.bin as the raw request body (Content-Type: application/octet-stream)."""
+    if db.scalars(select(Firmware).where(Firmware.version == version)).first():
+        raise HTTPException(409, f"Version {version} already exists")
+    data = await request.body()
+    if len(data) > settings.MAX_FIRMWARE_MB * 1024 * 1024:
+        raise HTTPException(413, "Firmware image too large")
+    if len(data) < 1024 or data[0] != 0xE9:              # every ESP32 app image starts with magic byte 0xE9
+        raise HTTPException(422, "This is not an ESP32 firmware image (.bin)")
+    folder = Path(settings.FIRMWARE_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    filename = f"coldchain-{version}.bin"
+    (folder / filename).write_bytes(data)
+    fw = Firmware(version=version, filename=filename, size=len(data), md5=hashlib.md5(data).hexdigest(),
+                  sha256=hashlib.sha256(data).hexdigest(), notes=notes, uploaded_by=admin.email)
+    db.add(fw)
+    audit(db, admin.email, "firmware.upload", f"{version} sha256={fw.sha256}")
+    db.commit()
+    return firmware_out(fw, db)
+
+
+@app.post("/api/firmware/{firmware_id}/rollout")
+def rollout_firmware(firmware_id: int, body: RolloutIn, admin: User = Depends(admin_user),
+                     db: Session = Depends(get_db)) -> dict:
+    fw = _get(db, Firmware, firmware_id)
+    query = select(Device) if body.all_devices else select(Device).where(Device.id.in_(body.device_ids or [0]))
+    devices = db.scalars(query).all()
+    for d in devices:
+        d.target_firmware_id, d.ota_status = fw.id, f"pending {fw.version}"
+    audit(db, admin.email, "firmware.rollout", f"{fw.version} -> {', '.join(d.serial for d in devices)}")
+    db.commit()
+    return {"version": fw.version, "devices": len(devices)}
+
+
+@app.delete("/api/firmware/{firmware_id}")
+def delete_firmware(firmware_id: int, admin: User = Depends(admin_user), db: Session = Depends(get_db)) -> dict:
+    fw = _get(db, Firmware, firmware_id)
+    for d in db.scalars(select(Device).where(Device.target_firmware_id == fw.id)):
+        d.target_firmware_id, d.ota_status = None, ""
+    (Path(settings.FIRMWARE_DIR) / fw.filename).unlink(missing_ok=True)
+    audit(db, admin.email, "firmware.delete", fw.version)
+    db.delete(fw)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/device/firmware/{firmware_id}.bin")
+def download_firmware(firmware_id: int, device: Device = Depends(current_device),
+                      db: Session = Depends(get_db)) -> FileResponse:
+    fw = _get(db, Firmware, firmware_id)
+    if device.target_firmware_id != fw.id:
+        raise HTTPException(403, "This firmware is not assigned to the device")
+    path = Path(settings.FIRMWARE_DIR) / fw.filename
+    if not path.exists():
+        raise HTTPException(410, "Firmware file is missing on the server")
+    return FileResponse(path, media_type="application/octet-stream", filename=fw.filename)
 
 
 @app.patch("/api/sensors/{sensor_id}")

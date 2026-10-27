@@ -35,6 +35,19 @@ class Settings(BaseSettings):
     # Readings timestamped further in the future than this are clamped to server time (bad device clock).
     MAX_CLOCK_SKEW_SECONDS: int = 300
 
+    # --- Stock & cooling control (ERP integration) ----------------------------------------------------------
+    # Grace period between the ERP saying "empty" and cooling actually going off (a mistaken update can be
+    # corrected in this window). Only for devices with auto_cooling_off enabled.
+    COOLING_OFF_DELAY_MINUTES: int = 30
+    # How often an empty appliance that is not sharing data still checks in (to receive "restocked").
+    EMPTY_HEARTBEAT_SECONDS: int = 900
+    # After restocking, HIGH alerts wait until the temperature is back in range, or this long at most.
+    PULLDOWN_MAX_MINUTES: int = 180
+
+    # --- Firmware updates (OTA) ------------------------------------------------------------------------------
+    FIRMWARE_DIR: str = "./firmware_store"
+    MAX_FIRMWARE_MB: int = 4
+
     # --- Alerting --------------------------------------------------------------------------------------
     # Unacknowledged alerts move to the next contact level after this long.
     ESCALATION_MINUTES: int = 15
