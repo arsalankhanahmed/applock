@@ -62,7 +62,10 @@ def admin_user(user: User = Depends(current_user)) -> User:
 
 def new_device_credentials() -> tuple[str, str]:
     """Return (serial, secret). The serial goes on the label; the secret is shown once and stored hashed."""
-    return f"CC-{secrets.token_hex(3).upper()}", secrets.token_urlsafe(24)
+    secret = secrets.token_urlsafe(24)
+    while secret.startswith("-"):                 # a leading dash reads as an option on command lines
+        secret = secrets.token_urlsafe(24)
+    return f"CC-{secrets.token_hex(3).upper()}", secret
 
 
 def hash_secret(secret: str) -> str:

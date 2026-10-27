@@ -86,11 +86,12 @@ def set_state(db: Session, device: Device, state: str, now: datetime, source: st
         else:
             plan = "Cooling stays on (automatic switch-off is not enabled for this appliance)."
         text = f"STOCK EMPTY: {location} reported empty by {source}{ref}. Temperature alerts paused. {plan}"
-    else:
-        if previous == "EMPTY":
-            device.pulldown_until = now + timedelta(minutes=settings.PULLDOWN_MAX_MINUTES)
+    elif previous == "EMPTY":
+        device.pulldown_until = now + timedelta(minutes=settings.PULLDOWN_MAX_MINUTES)
         text = (f"RESTOCKED: {location} reported stocked by {source}{ref}. Cooling ON; temperature alerts resume "
                 f"once it is back in range (at most {settings.PULLDOWN_MAX_MINUTES} min).")
         if not online:
             text += " WARNING: the device is OFFLINE and cannot receive the command - check the appliance by hand."
+    else:
+        text = f"STOCKED: {location} marked stocked by {source}{ref}."
     return True, [Event("info", 0, device_id=device.id, text=text)]

@@ -426,8 +426,8 @@ async function viewDevices() {
   }));
   $app.querySelectorAll("[data-history]").forEach((b) => (b.onclick = async () => {
     const rows = await api(`/api/devices/${b.dataset.history}/stock-events`);
-    $app.querySelector(`[data-history-slot="${b.dataset.history}"]`).innerHTML = rows.length ? `<table><tr><th>When</th><th>State</th><th>Qty</th><th>Ref</th><th>Source</th></tr>
-      ${rows.map((r) => `<tr><td>${fmtTime(r.at)}</td><td>${esc(r.state)}</td><td>${r.quantity ?? ""}</td><td>${esc(r.reference)}</td><td>${esc(r.source)}</td></tr>`).join("")}</table>` : `<p class="muted">No stock updates yet.</p>`;
+    $app.querySelector(`[data-history-slot="${b.dataset.history}"]`).innerHTML = rows.length ? `<div class="table-wrap"><table><tr><th>When</th><th>State</th><th>Qty</th><th>Ref</th><th>Source</th></tr>
+      ${rows.map((r) => `<tr><td>${fmtTime(r.at)}</td><td>${esc(r.state)}</td><td>${r.quantity ?? ""}</td><td>${esc(r.reference)}</td><td>${esc(r.source)}</td></tr>`).join("")}</table></div>` : `<p class="muted">No stock updates yet.</p>`;
   }));
   $app.querySelectorAll("[data-rotate]").forEach((b) => (b.onclick = async () => {
     if (!confirm("Issue a new key? The device stops reporting until it is set up with the new key.")) return;

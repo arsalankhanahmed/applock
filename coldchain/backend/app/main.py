@@ -238,10 +238,12 @@ def ingest(body: IngestIn, background: BackgroundTasks, device: Device = Depends
             setattr(device, field, value)
     if body.cooling is not None and body.cooling != device.cooling_reported:
         if device.cooling_reported is not None:             # not on the very first report
+            why = {"EMPTY": "appliance empty", "STOCKED": "appliance stocked"}.get(device.stock_state, "")
+            if device.cooling_override or not why:
+                why = "set from the dashboard" if device.cooling_override else "by the device"
             word = "switched OFF" if body.cooling == "off" else "switched back ON"
             events.append(engine.Event("info", 0, device_id=device.id,
-                                       text=f"COOLING {word}: {device.site.name} / {device.name} "
-                                            f"(stock {device.stock_state.lower()})."))
+                                       text=f"COOLING {word}: {device.site.name} / {device.name} ({why})."))
         audit(db, f"device:{device.serial}", "device.cooling", f"relay {body.cooling}")
         device.cooling_reported = body.cooling
     if body.ota_error:

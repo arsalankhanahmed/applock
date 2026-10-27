@@ -34,7 +34,7 @@
 #define RELAY_ACTIVE_LEVEL HIGH // level that ENERGISES the relay, which switches cooling OFF (NC contact)
 #endif
 
-// 4G modem (only with -D TINY_GSM_MODEM_SIM7600 / A7672X): UART and power key.
+// 4G modem (only with -D TINY_GSM_MODEM_A7672X, i.e. the esp32dev-4g build): UART and power key.
 #ifndef PIN_MODEM_RX
 #define PIN_MODEM_RX 16         // ESP32 RX  <- modem TX
 #endif

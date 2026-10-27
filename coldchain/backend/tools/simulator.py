@@ -4,6 +4,7 @@
     python tools/simulator.py ... --profile fridge --fault high      # door left open: temperature climbs
     python tools/simulator.py ... --fault power                      # mains fails: device reports battery
     python tools/simulator.py ... --backfill 24                      # upload 24 h of history first
+    python tools/simulator.py ... --relay                            # obey cooling on/off from the server
 
 Uses only the standard library, so it runs anywhere Python does.
 """
@@ -27,9 +28,9 @@ PROFILES = {
 }
 
 
-def reading(profile: str, t: float, fault: str, fault_age: float) -> dict:
+def reading(profile: str, t: float, fault: str, fault_age: float, warming: float = 0.0) -> dict:
     centre, swing, hum = PROFILES[profile]
-    temp = centre + swing * math.sin(t / 1800) + random.uniform(-0.15, 0.15)
+    temp = centre + swing * math.sin(t / 1800) + random.uniform(-0.15, 0.15) + warming
     if fault == "high":
         temp += min(fault_age / 60 * 0.6, 15)          # +0.6 °C per minute, capped
     elif fault == "low":
@@ -59,6 +60,7 @@ def main() -> int:
     p.add_argument("--backfill", type=float, default=0, help="hours of history to upload first")
     p.add_argument("--once", action="store_true", help="send one batch and exit")
     p.add_argument("--fast", type=float, default=1.0, help="speed-up factor for the live loop")
+    p.add_argument("--relay", action="store_true", help="simulate a cooling relay that follows the server")
     args = p.parse_args()
 
     interval = 60
@@ -71,19 +73,29 @@ def main() -> int:
         print(f"Backfilled {len(history)} readings")
 
     start = time.time()
+    cooling, record, warming = "on", True, 0.0
     while True:
         now = time.time()
         elapsed = now - start
         fault = args.fault if elapsed >= args.fault_after else "none"
         fault_age = elapsed - args.fault_after
-        body = {"readings": [reading(args.profile, now, fault, fault_age)], "firmware": "sim-1.0",
+        # With cooling off the appliance drifts up towards room temperature; with it on it pulls back down.
+        warming = min(warming + 0.5, 20.0) if cooling == "off" else max(warming - 1.0, 0.0)
+        readings = [reading(args.profile, now, fault, fault_age, warming)] if record else []
+        body = {"readings": readings, "firmware": "sim-1.0",
                 "rssi": random.randint(-75, -55), "network": "wifi",
                 "mains_power": fault != "power", "battery_pct": 100.0 if fault != "power" else 85.0}
+        if args.relay:
+            body["cooling"] = cooling
         try:
             res = post(args.server, args.serial, args.key, body)
             interval = res.get("interval_seconds", interval)
-            print(f"{time.strftime('%H:%M:%S')} sent {body['readings'][0]['values']} "
-                  f"mains={body['mains_power']} -> next in {interval}s")
+            record = res.get("record", True)
+            if args.relay and res.get("cooling") in ("on", "off"):
+                cooling = res["cooling"]
+            sent = body["readings"][0]["values"] if body["readings"] else "heartbeat"
+            print(f"{time.strftime('%H:%M:%S')} sent {sent} mains={body['mains_power']} "
+                  f"cooling={res.get('cooling')} -> next in {interval}s")
         except urllib.error.HTTPError as exc:
             print(f"HTTP {exc.code}: {exc.read().decode()[:200]}", file=sys.stderr)
             if exc.code == 401:

@@ -3,7 +3,8 @@
 // Every interval the node reads its sensors, appends the reading to a queue file in flash (LittleFS) and then
 // uploads as much of the queue as it can. When Wi-Fi or the server is down, readings pile up in the queue and
 // are sent, with their original timestamps, once the connection is back - so the record has no gaps.
-// Built with a 4G modem (esp32dev-4g), it uploads over cellular whenever Wi-Fi is down.
+// Built with a 4G modem (esp32dev-4g, SIMCom A7670), it uploads over cellular whenever Wi-Fi is down; TLS runs
+// inside the modem, which is given the same root certificates and told to verify the server.
 //
 // Each upload response carries the reading interval, the alert limits (used for the local buzzer, which still
 // works without a network), whether to keep recording, the cooling command and, when assigned, a firmware update.
@@ -38,16 +39,17 @@
 #include "certs.h"
 #include "config.h"
 
-#if defined(TINY_GSM_MODEM_SIM7600) || defined(TINY_GSM_MODEM_A7672X)
+#if defined(TINY_GSM_MODEM_A7672X)
 #define USE_CELLULAR 1
 #include <ArduinoHttpClient.h>
-#include <SSLClient.h>
 #include <TinyGsmClient.h>
 HardwareSerial SerialAT(1);
 TinyGsm modem(SerialAT);
-TinyGsmClient gsmClient(modem);
-SSLClient gsmSecure(&gsmClient);
+TinyGsmClient gsmClient(modem, 0);
+TinyGsmClientSecure gsmSecure(modem, 1);
 String apn;
+bool modemTlsReady = false;
+static const char *MODEM_CA_FILE = "coldchain_ca.pem";
 #endif
 
 static const char *QUEUE_FILE = "/queue.jsonl";
@@ -347,12 +349,23 @@ bool cellularConnect() {
       Serial.println("[4g] clock set from network time");
     }
   }
+  if (!modemTlsReady) {
+    // Load our root certificates into the modem and make it verify the server (authmode 1), which
+    // the library does not switch on by itself.
+    modemTlsReady = gsmSecure.addCertificate(MODEM_CA_FILE, ROOT_CAS, strlen(ROOT_CAS));
+    gsmSecure.setCertificate(MODEM_CA_FILE);
+    modem.sendAT(GF("+CSSLCFG=\"authmode\",0,1"));
+    modemTlsReady = modem.waitResponse(5000L) == 1 && modemTlsReady;
+    if (!modemTlsReady) Serial.println("[4g] could not load certificates into the modem");
+  }
   Serial.println("[4g] connected");
   return true;
 }
 
 int cellularPost(const Url &u, const String &path, const String &body, String &response) {
-  if (u.https) gsmSecure.setCACert(ROOT_CAS);
+#ifndef TLS_INSECURE
+  if (u.https && !modemTlsReady) return 0;                // never send the key over unverified TLS
+#endif
   Client &client = u.https ? static_cast<Client &>(gsmSecure) : static_cast<Client &>(gsmClient);
   HttpClient http(client, u.host.c_str(), u.port);
   http.setHttpResponseTimeout(HTTP_TIMEOUT_MS);

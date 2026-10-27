@@ -12,6 +12,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; }
 a { color: var(--accent); text-decoration: none; }
 h1 { font-size: 22px; margin: 0 0 16px; }
